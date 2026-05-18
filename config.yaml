@@ -1,0 +1,90 @@
+# 小源 - 开源协会顾问猫娘 配置文件
+# 敏感信息请通过 .env 环境变量设置
+
+# 允许回复的群号列表 (空列表 = 允许所有群)
+allowed_group_ids: ["1056259135"]
+
+# 数据库文件路径
+database_path: "${DATABASE_PATH:-data/xiaomo.db}"
+
+bot:
+  name: "小源"
+  nickname: "小源"
+  qq_id: "3115709797"
+  persona_version: 2
+
+llm:
+  provider: "deepseek"
+  api_base: "${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}"
+  api_key: "${DEEPSEEK_API_KEY:-}"
+  model: "${DEEPSEEK_MODEL:-deepseek-chat}"
+  max_tokens: 4096
+  temperature: 0.8
+
+vision:
+  provider: "mimo"
+  api_base: "${VISION_API_BASE:-https://api.xiaomimimo.com/v1}"
+  anthropic_base: "${VISION_ANTHROPIC_BASE:-https://api.xiaomimimo.com/anthropic}"
+  api_key: "${VISION_API_KEY:-}"
+  model: "${VISION_MODEL:-mimo-v2.5}"
+  max_tokens: 1024
+  max_image_size_mb: 20
+
+weather:
+  target_group: "1056259135"
+
+memory:
+  weight_half_life_minutes: 60
+  max_context_tokens: 8000
+  compress_threshold_tokens: 15000
+  keep_recent_messages: 50
+
+# 向量语义记忆
+vector:
+  model: "BAAI/bge-small-zh-v1.5"
+  search_results: 10
+
+silent_window:
+  private_seconds: 3
+  group_seconds: 5
+
+auto_action:
+  bubble_inactive_minutes: 30
+  bubble_cooldown_minutes: 60
+  repeat_threshold: 3
+  repeat_cooldown_minutes: 30
+
+output:
+  max_chars_per_message: 800
+  max_code_lines: 50
+
+safety:
+  enabled: true
+  blocklist_file: "data/blocklist.txt"
+
+# 弔图语录 / 关键词反应
+reactions:
+  cooldown_minutes: 0  # 0 = 无冷却
+  triggers:
+    "寄了": "▄︻デ══━一💥 寄！"
+    "寄寄": "▄︻デ══━一💥 双倍寄！"
+    "开卷": "卷王来了，快跑！🏃💨"
+    "卷起来": "卷王来了，快跑！🏃💨"
+    "摸鱼": "(=^･ω･^=) 摸鱼也是生产力喵～"
+    "划水": "(´∀｀) 划水要悄悄地划..."
+    "熬夜": "早点睡呀同学！嵌入式工程师不需要头发吗 (´;ω;`)"
+    "ddl": "DDL 是第一生产力 ✍️🔥 冲！"
+    "通宵": "通宵伤身体！明天还要调板子呢 (｀・ω・´)"
+    "焊坏": "烙铁温度调低点！焊盘掉了就真寄了 ... 小源的建议是：先涂助焊剂"
+    "冒烟": "断电！快断电！💨 芯片冒烟了！"
+    "差不多了": "差不多就是差很多！再测一遍！(｀・ω・´)"
+    "bug": "喵？有 bug？调出来了吗 (´･ω･`) 需要小源帮忙看看吗？"
+    "出bug": "喵？有 bug？调出来了吗 (´･ω･`) 需要小源帮忙看看吗？"
+    "github": "传 GitHub 了没？commit message 写清楚！"
+    "开源": "开源精神永存！(๑•̀ㅂ•́)و✧"
+    "示波器": "波形看仔细！先排除电源纹波再查信号完整性～"
+    "烧录": "记得接好 JTAG/SWD，确认供电了再烧！"
+    "串口": "波特率确认了没？TX RX 交叉接了吗？"
+    "谢": "不客气喵～ (=^･ω･^=)"
+    "谢谢": "不客气喵～ (=^･ω･^=)"
+    "小源": null  # null = 不触发关键词反应，走正常 LLM 流程
