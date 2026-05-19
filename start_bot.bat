@@ -79,6 +79,7 @@ rem === 启动 LLBot ===
 tasklist /FI "IMAGENAME eq llbot.exe" 2>NUL | find /I "llbot.exe" >NUL
 if !ERRORLEVEL! NEQ 0 (
     set LLBOT_EXE=
+    set LLBOT_DIR=
     for %%d in (
         "%~dp0llbot\llbot.exe"
         "C:\Users\!USERNAME!\LLBot\llbot.exe"
@@ -92,12 +93,26 @@ if !ERRORLEVEL! NEQ 0 (
     )
     echo [提示] 未找到 LLBot，跳过 QQ 桥接
     echo        下载: https://github.com/LLOneBot/LuckyLilliaBot/releases
+    echo        解压到项目 llbot\ 目录后重新运行
     goto :skip_llbot
 
     :llbot_found
-    echo [LLBot] 启动 QQ 桥接...
+    echo [LLBot] 准备启动 QQ 桥接...
+    rem 自动覆盖默认配置模板（确保 ws-reverse 启用）
+    if exist "%~dp0llbot.config.json" (
+        copy /Y "%~dp0llbot.config.json" "!LLBOT_DIR!config.json" >nul
+    )
+    if exist "%~dp0llbot.default_config.json" (
+        copy /Y "%~dp0llbot.default_config.json" "!LLBOT_DIR!bin\llbot\default_config.json" >nul
+    )
+    rem 清除旧运行数据，强制从模板重新生成
+    if exist "!LLBOT_DIR!bin\llbot\data" (
+        echo [LLBot] 清理旧配置...
+        rmdir /S /Q "!LLBOT_DIR!bin\llbot\data" >nul 2>&1
+    )
+    echo [LLBot] 启动...
     start "" /D "!LLBOT_DIR!" "!LLBOT_EXE!"
-    echo [LLBot] 等待注入（15秒）...
+    echo [LLBot] 等待注入并登录（15秒）...
     timeout /t 15 /nobreak >NUL
 ) else (
     echo [LLBot] 已在运行

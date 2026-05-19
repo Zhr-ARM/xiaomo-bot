@@ -36,5 +36,5 @@ data/weather_test.txt
 # NapCat 下载工具残留
 data/napcat_release.json
 
-# LLBot（外部工具，用户自行下载 https://github.com/LLOneBot/LuckyLilliaBot/releases）
+# LLBot 安装目录（用户自行下载 https://github.com/LLOneBot/LuckyLilliaBot/releases）
 llbot/
