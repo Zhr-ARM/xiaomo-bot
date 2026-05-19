@@ -8,6 +8,14 @@ echo   小源 QQ 机器人
 echo ============================================
 echo.
 
+rem === 清理旧进程 ===
+echo [清理] 检查旧进程...
+taskkill /F /IM python.exe /FI "WINDOWTITLE eq *bot.py*" >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8080" ^| findstr "LISTENING"') do (
+    echo [清理] 关闭占用端口 8080 的进程 %%a...
+    taskkill /F /PID %%a >nul 2>&1
+)
+
 rem === 检测 Python ===
 set PYTHON_CMD=
 for %%p in (python python3) do (
@@ -33,7 +41,7 @@ for %%d in (
 )
 
 echo [错误] 未找到 Python 3.10+
-echo 请安装后重试: https://www.python.org/downloads/
+echo 请安装: https://www.python.org/downloads/
 pause
 exit /b 1
 
@@ -52,17 +60,16 @@ if not exist "src\xiaomo_bot.egg-info" (
     echo [完成] 依赖安装完毕
 )
 
-rem === 复制 .env（首次运行） ===
+rem === 首次初始化 ===
 if not exist ".env" (
     echo [初始化] 创建 .env，请编辑填入 API Key
     copy .env.example .env >nul
-    echo [提示] 请编辑 .env 文件填入 DEEPSEEK_API_KEY 后重新运行
+    echo [提示] 编辑 .env 填入 DEEPSEEK_API_KEY 后重新运行
     start notepad .env
     pause
     exit /b 0
 )
 
-rem === 检查 persona.md ===
 if not exist "data\persona.md" (
     echo [初始化] 创建 data\persona.md
     copy data\persona.example.md data\persona.md >nul
@@ -71,19 +78,35 @@ if not exist "data\persona.md" (
 rem === 启动 LLBot ===
 tasklist /FI "IMAGENAME eq llbot.exe" 2>NUL | find /I "llbot.exe" >NUL
 if !ERRORLEVEL! NEQ 0 (
-    if exist "llbot\llbot.exe" (
-        echo [LLBot] 启动 QQ 桥接...
-        start "" /D "%~dp0llbot" "%~dp0llbot\llbot.exe"
-        echo [LLBot] 等待 QQ 登录（15秒）...
-        timeout /t 15 /nobreak >NUL
-    ) else (
-        echo [提示] 未找到 llbot\llbot.exe，跳过 QQ 桥接
+    set LLBOT_EXE=
+    for %%d in (
+        "%~dp0llbot\llbot.exe"
+        "C:\Users\!USERNAME!\LLBot\llbot.exe"
+        "C:\LLBot\llbot.exe"
+    ) do (
+        if exist %%d (
+            set LLBOT_EXE=%%~d
+            set LLBOT_DIR=%%~dpd
+            goto :llbot_found
+        )
     )
+    echo [提示] 未找到 LLBot，跳过 QQ 桥接
+    echo        下载: https://github.com/LLOneBot/LuckyLilliaBot/releases
+    goto :skip_llbot
+
+    :llbot_found
+    echo [LLBot] 启动 QQ 桥接...
+    start "" /D "!LLBOT_DIR!" "!LLBOT_EXE!"
+    echo [LLBot] 等待注入（15秒）...
+    timeout /t 15 /nobreak >NUL
 ) else (
     echo [LLBot] 已在运行
 )
 
+:skip_llbot
+
 rem === 启动机器人 ===
 echo [启动] 小源机器人...
+echo.
 !PYTHON_CMD! -u bot.py
 pause

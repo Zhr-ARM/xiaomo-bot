@@ -36,11 +36,5 @@ data/weather_test.txt
 # NapCat 下载工具残留
 data/napcat_release.json
 
-# LLBot 运行时生成的数据
-llbot/qrcode.png
-llbot/bin/llbot/data/config_*.json
-llbot/bin/llbot/data/email_config.json
-llbot/bin/llbot/data/database/
-llbot/bin/llbot/data/logs/
-llbot/bin/llbot/data/temp/
-llbot/*.log
+# LLBot（外部工具，用户自行下载 https://github.com/LLOneBot/LuckyLilliaBot/releases）
+llbot/

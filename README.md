@@ -24,8 +24,9 @@
 | Python 3.10+ | 机器人运行环境 |
 | QQ 账号 | 机器人的 QQ 号（建议用小号） |
 | DeepSeek API Key | LLM 对话（[platform.deepseek.com](https://platform.deepseek.com)） |
+| LLBot | QQ 桥接（[GitHub Releases](https://github.com/LLOneBot/LuckyLilliaBot/releases)） |
 
-## 快速开始（3 步）
+## 快速开始（4 步）
 
 ### 1. 克隆项目
 
@@ -34,17 +35,37 @@ git clone https://github.com/Zhr-ARM/xiaomo-bot.git
 cd xiaomo-bot
 ```
 
-### 2. 运行启动脚本
+### 2. 安装 LLBot（QQ 桥接）
+
+从 [LLBot Releases](https://github.com/LLOneBot/LuckyLilliaBot/releases) 下载最新版，解压到 `C:\Users\<用户名>\LLBot\`（或其他路径）。
+
+编辑 `config.json`，确认反向 WebSocket 指向机器人：
+
+```json
+{
+  "ob11": {
+    "enable": true,
+    "connect": [{
+      "type": "ws-reverse",
+      "enable": true,
+      "url": "ws://127.0.0.1:8080/onebot/v11/ws",
+      "messageFormat": "array"
+    }]
+  }
+}
+```
+
+### 3. 运行启动脚本
 
 ```bash
 start_bot.bat
 ```
 
-首次运行会自动完成：安装 Python 依赖 → 创建 `.env` 模板 → 初始化人设 → 启动 LLBot QQ 桥接 → 启动机器人。
+首次运行会自动：安装 Python 依赖 → 创建 `.env` 模板 → 初始化人设 → 启动 LLBot → 启动机器人。
 
 > 如果提示缺少 Python，请先安装 [Python 3.10+](https://www.python.org/downloads/)。
 
-### 3. 配置
+### 4. 配置
 
 编辑 `.env`，填入 DeepSeek API Key：
 
@@ -62,7 +83,7 @@ bot:
 
 然后重新运行 `start_bot.bat`。
 
-> LLBot 已内置在 `llbot/` 目录，无需额外下载。启动后会自动检测本地 QQ 并注入桥接，扫码登录即可。
+> LLBot 启动后会自动检测本地 QQ 并注入桥接，扫码登录即可。
 
 ## 自定义人设
 
