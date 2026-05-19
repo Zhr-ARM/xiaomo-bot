@@ -10,10 +10,18 @@ echo.
 
 rem === 清理旧进程 ===
 echo [清理] 检查旧进程...
-taskkill /F /IM python.exe /FI "WINDOWTITLE eq *bot.py*" >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8080" ^| findstr "LISTENING"') do (
+rem 先停旧 bot（占用 8080 端口的进程）
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8080 " ^| findstr "LISTENING"') do (
     echo [清理] 关闭占用端口 8080 的进程 %%a...
     taskkill /F /PID %%a >nul 2>&1
+)
+rem 再停旧的 LLBot
+tasklist /FI "IMAGENAME eq llbot.exe" 2>NUL | find /I "llbot.exe" >NUL
+if !ERRORLEVEL! EQU 0 (
+    echo [清理] 关闭旧 LLBot...
+    taskkill /F /IM llbot.exe >nul 2>&1
+    taskkill /F /IM node.exe >nul 2>&1
+    taskkill /F /IM pmhq.exe >nul 2>&1
 )
 
 rem === 检测 Python ===
@@ -98,17 +106,17 @@ if !ERRORLEVEL! NEQ 0 (
 
     :llbot_found
     echo [LLBot] 准备启动 QQ 桥接...
-    rem 自动覆盖默认配置模板（确保 ws-reverse 启用）
+    rem 覆盖配置模板，确保 ws-reverse 默认启用
     if exist "%~dp0llbot.config.json" (
-        copy /Y "%~dp0llbot.config.json" "!LLBOT_DIR!config.json" >nul
+        copy /Y "%~dp0llbot.config.json" "!LLBOT_DIR!config.json" >nul 2>&1
     )
     if exist "%~dp0llbot.default_config.json" (
-        copy /Y "%~dp0llbot.default_config.json" "!LLBOT_DIR!bin\llbot\default_config.json" >nul
+        copy /Y "%~dp0llbot.default_config.json" "!LLBOT_DIR!bin\llbot\default_config.json" >nul 2>&1
     )
-    rem 清除旧运行数据，强制从模板重新生成
-    if exist "!LLBOT_DIR!bin\llbot\data" (
-        echo [LLBot] 清理旧配置...
-        rmdir /S /Q "!LLBOT_DIR!bin\llbot\data" >nul 2>&1
+    rem 删除旧的 per-QQ 配置，启动时会从模板重新生成
+    if exist "!LLBOT_DIR!bin\llbot\data\config_*.json" (
+        echo [LLBot] 更新 QQ 专属配置...
+        del /Q "!LLBOT_DIR!bin\llbot\data\config_*.json" >nul 2>&1
     )
     echo [LLBot] 启动...
     start "" /D "!LLBOT_DIR!" "!LLBOT_EXE!"
@@ -123,5 +131,18 @@ if !ERRORLEVEL! NEQ 0 (
 rem === 启动机器人 ===
 echo [启动] 小源机器人...
 echo.
+echo ============================================
+echo   机器人正在运行，请勿关闭此窗口
+echo ============================================
+echo.
 !PYTHON_CMD! -u bot.py
+if !ERRORLEVEL! NEQ 0 (
+    echo.
+    echo [错误] 机器人意外退出（错误码: !ERRORLEVEL!）
+    echo 常见原因:
+    echo   1. 端口 8080 被占用 — 关闭占用程序后重试
+    echo   2. .env 中的 API Key 未配置或失效
+    echo   3. 依赖缺失 — 尝试运行 pip install -e .
+    echo.
+)
 pause
