@@ -1,0 +1,48 @@
+{
+  "webui": {
+    "enable": true,
+    "host": "127.0.0.1",
+    "port": 3080
+  },
+  "milky": {
+    "enable": false
+  },
+  "satori": {
+    "enable": false
+  },
+  "ob11": {
+    "enable": true,
+    "connect": [
+      {
+        "type": "ws-reverse",
+        "enable": true,
+        "url": "ws://127.0.0.1:8080/onebot/v11/ws",
+        "heartInterval": 60000,
+        "token": "",
+        "reportSelfMessage": false,
+        "reportOfflineMessage": false,
+        "messageFormat": "array",
+        "debug": false
+      },
+      {
+        "type": "ws",
+        "enable": false
+      },
+      {
+        "type": "http",
+        "enable": false
+      },
+      {
+        "type": "http-post",
+        "enable": false
+      }
+    ]
+  },
+  "enableLocalFile2Url": false,
+  "log": true,
+  "autoDeleteFile": false,
+  "autoDeleteFileSecond": 60,
+  "musicSignUrl": "",
+  "msgCacheExpire": 120,
+  "ffmpeg": ""
+}
