@@ -20,114 +20,55 @@
 
 | 依赖 | 说明 |
 |------|------|
-| Windows 10+ | QQ 桌面端仅支持 Windows（LLBot 注入方式） |
+| Windows 10+ | QQ 桌面端仅支持 Windows |
 | Python 3.10+ | 机器人运行环境 |
 | QQ 账号 | 机器人的 QQ 号（建议用小号） |
 | DeepSeek API Key | LLM 对话（[platform.deepseek.com](https://platform.deepseek.com)） |
-| LLBot 或 NapCatQQ | OneBot v11 协议桥接，连接 QQ 与机器人 |
 
-## 快速开始
+## 快速开始（3 步）
 
 ### 1. 克隆项目
 
 ```bash
-git clone <repo-url> xiaomo-bot
+git clone https://github.com/Zhr-ARM/xiaomo-bot.git
 cd xiaomo-bot
 ```
 
-### 2. 安装依赖
+### 2. 运行启动脚本
 
 ```bash
-pip install -e .
+start_bot.bat
 ```
 
-首次启动时会自动下载嵌入模型 `BAAI/bge-small-zh-v1.5`（约 100MB）。
+首次运行会自动完成：安装 Python 依赖 → 创建 `.env` 模板 → 初始化人设 → 启动 LLBot QQ 桥接 → 启动机器人。
+
+> 如果提示缺少 Python，请先安装 [Python 3.10+](https://www.python.org/downloads/)。
 
 ### 3. 配置
 
-```bash
-# 复制环境变量模板
-copy .env.example .env
-
-# 编辑 .env，填入你的 API Key
-notepad .env
-```
-
-必填配置项：
+编辑 `.env`，填入 DeepSeek API Key：
 
 ```ini
-DEEPSEEK_API_KEY=sk-xxxxx      # DeepSeek API Key（必填）
-ONEBOT_WS_URL=ws://127.0.0.1:3001  # OneBot 连接地址
+DEEPSEEK_API_KEY=sk-xxxxx
 ```
 
-编辑 `config.yaml`，修改：
+编辑 `config.yaml`，修改群号和机器人 QQ：
 
 ```yaml
-allowed_group_ids: ["你的群号"]   # 允许回复的群
+allowed_group_ids: ["你的群号"]
 bot:
   qq_id: "机器人QQ号"
-weather:
-  target_group: "天气推送群号"    # 不需要可删除整个 weather 块
 ```
 
-### 4. 自定义人设
+然后重新运行 `start_bot.bat`。
 
-```bash
-copy data\persona.example.md data\persona.md
-notepad data\persona.md
-```
+> LLBot 已内置在 `llbot/` 目录，无需额外下载。启动后会自动检测本地 QQ 并注入桥接，扫码登录即可。
 
-可选：创建群聊记忆库：
+## 自定义人设
 
-```bash
-copy data\memory.example.md data\memory.md
-notepad data\memory.md
-```
+编辑 `data/persona.md` 定义机器人角色（首次运行已自动从模板创建）。
 
-### 5. 安装 QQ 桥接（二选一）
-
-QQ 桥接是机器人收发消息的通道。将 QQ 桌面端的消息转发给 NoneBot，同时把机器人的回复发回 QQ。
-
-**方案 A：LLBot（推荐，最简单）**
-
-1. 下载 [LLBot](https://github.com/LLOneBot/LuckyLilliaBot/releases) 或访问官网 [luckylillia.com](https://luckylillia.com)
-2. 解压到任意目录（如 `C:\LLBot`）
-3. 编辑 `config.json`，确认反向 WebSocket 配置指向机器人：
-
-```json
-{
-  "ob11": {
-    "enable": true,
-    "connect": [{
-      "type": "ws-reverse",
-      "enable": true,
-      "url": "ws://127.0.0.1:8080/onebot/v11/ws",
-      "messageFormat": "array"
-    }]
-  }
-}
-```
-
-4. 运行 `llbot.exe` — 它会自动检测本地 QQ 并注入桥接 DLL
-5. 手机扫码登录 QQ
-
-**方案 B：NapCatQQ**
-
-1. 下载 [NapCatQQ](https://github.com/NapNeko/NapCatQQ/releases)
-2. 配置 WebSocket 连接到 `ws://127.0.0.1:8080/onebot/v11/ws`
-3. 启动 NapCatQQ 并登录 QQ
-
-> **注意**：QQ 桌面端必须保持运行。LLBot/NapCatQQ 需要注入到 QQ 进程中，仅支持 Windows。
-
-### 6. 启动
-
-```bash
-# 方式一：直接运行
-python bot.py
-
-# 方式二：使用启动脚本（会同时检测并启动 LLBot）
-start_bot.bat
-```
+可选：复制 `data/memory.example.md` → `data/memory.md`，编辑群聊背景知识。
 
 ## 项目结构
 
