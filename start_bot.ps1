@@ -1,85 +1,138 @@
-# 小源 QQ 机器人 - 一键启动脚本
-$ErrorActionPreference = "Stop"
+# Xiaoyuan QQ Bot - Startup Script
+$ErrorActionPreference = "Continue"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
 Write-Host "============================================"
-Write-Host "  小源 QQ 机器人"
+Write-Host "  Xiaoyuan QQ Bot"
 Write-Host "============================================"
 Write-Host ""
 
-# ── 检测 Python ──
+# === Clean old processes ===
+Write-Host "[Clean] Checking old processes..."
+$port8080 = netstat -ano | Select-String ":8080 .*LISTENING"
+if ($port8080) {
+    $pidMatch = [regex]::Match($port8080, '\s+(\d+)\s*$')
+    if ($pidMatch.Success) {
+        $oldPid = $pidMatch.Groups[1].Value
+        Write-Host "[Clean] Killing port 8080 process $oldPid..."
+        taskkill /F /PID $oldPid 2>&1 | Out-Null
+    }
+}
+Get-Process -Name "llbot", "node", "pmhq" -ErrorAction SilentlyContinue | Stop-Process -Force
+Write-Host "[Clean] Done"
+Write-Host ""
+
+# === Find Python ===
 $pythonCmd = $null
-foreach ($cmd in @("python3", "python")) {
+foreach ($cmd in @("python", "python3")) {
     $found = Get-Command $cmd -ErrorAction SilentlyContinue
     if ($found) { $pythonCmd = $cmd; break }
 }
 if (-not $pythonCmd) {
     $paths = @(
-        "D:\Python312\python.exe", "C:\Python312\python.exe",
-        "C:\Python311\python.exe", "C:\Python310\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
+        "D:\Python312\python.exe",
+        "C:\Python312\python.exe",
+        "C:\Python311\python.exe",
+        "C:\Python310\python.exe"
     )
     foreach ($p in $paths) {
-        $expanded = [Environment]::ExpandEnvironmentVariables($p)
-        if (Test-Path $expanded) { $pythonCmd = $expanded; break }
+        if (Test-Path $p) { $pythonCmd = $p; break }
     }
 }
 if (-not $pythonCmd) {
-    Write-Host "[错误] 未找到 Python 3.10+" -ForegroundColor Red
-    Write-Host "请安装: https://www.python.org/downloads/"
-    Read-Host "按 Enter 退出"
+    Write-Host "[Error] Python not found" -ForegroundColor Red
+    Write-Host "Install from https://www.python.org/downloads/"
+    Read-Host "Press Enter to exit"
     exit 1
 }
 Write-Host "[Python] $pythonCmd"
 $env:PYTHONIOENCODING = "utf-8"
 
-# ── 安装依赖（首次） ──
+# === Install deps (first run) ===
 if (-not (Test-Path "src\xiaomo_bot.egg-info")) {
-    Write-Host "[安装] 正在安装依赖..."
+    Write-Host "[Install] Installing dependencies..."
     & $pythonCmd -m pip install -e . --quiet
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[错误] 依赖安装失败" -ForegroundColor Red
-        Read-Host "按 Enter 退出"
+        Write-Host "[Error] Dependency install failed" -ForegroundColor Red
+        Read-Host "Press Enter to exit"
         exit 1
     }
-    Write-Host "[完成] 依赖安装完毕"
+    Write-Host "[Done] Dependencies installed"
 }
 
-# ── 复制 .env（首次） ──
+# === First run init ===
 if (-not (Test-Path ".env")) {
-    Write-Host "[初始化] 创建 .env，请编辑填入 API Key"
+    Write-Host "[Init] Creating .env - please add your API key"
     Copy-Item .env.example .env
-    Write-Host "[提示] 请编辑 .env 填入 DEEPSEEK_API_KEY 后重新运行" -ForegroundColor Yellow
+    Write-Host "[Hint] Edit .env and set DEEPSEEK_API_KEY, then re-run" -ForegroundColor Yellow
     Start-Process notepad .env
-    Read-Host "按 Enter 退出"
+    Read-Host "Press Enter to exit"
     exit 0
 }
 
-# ── 初始化 persona.md ──
 if (-not (Test-Path "data\persona.md")) {
-    Write-Host "[初始化] 创建 data\persona.md"
+    Write-Host "[Init] Creating data\persona.md"
     Copy-Item data\persona.example.md data\persona.md
 }
 
-# ── 启动 LLBot ──
-$llbotExe = Join-Path $scriptDir "llbot\llbot.exe"
-$llbotProc = Get-Process -Name "llbot" -ErrorAction SilentlyContinue
-if (-not $llbotProc) {
-    if (Test-Path $llbotExe) {
-        Write-Host "[LLBot] 启动 QQ 桥接..."
-        Start-Process -FilePath $llbotExe -WorkingDirectory (Join-Path $scriptDir "llbot")
-        Write-Host "[LLBot] 等待 QQ 登录（15秒）..."
-        Start-Sleep -Seconds 15
-    } else {
-        Write-Host "[提示] 未找到 llbot\llbot.exe，跳过 QQ 桥接" -ForegroundColor Yellow
+# === Start LLBot ===
+$llbotExe = $null
+$llbotDir = $null
+$searchPaths = @(
+    "$scriptDir\llbot\llbot.exe",
+    "$env:USERPROFILE\LLBot\llbot.exe",
+    "C:\LLBot\llbot.exe"
+)
+foreach ($p in $searchPaths) {
+    if (Test-Path $p) {
+        $llbotExe = $p
+        $llbotDir = Split-Path $p
+        break
     }
-} else {
-    Write-Host "[LLBot] 已在运行 (PID: $($llbotProc.Id))"
 }
 
-# ── 启动机器人 ──
-Write-Host "[启动] 小源机器人..."
+$llbotRunning = Get-Process -Name "llbot" -ErrorAction SilentlyContinue
+if ($llbotExe -and -not $llbotRunning) {
+    Write-Host "[LLBot] Found at $llbotDir"
+    # Patch configs to enable ws-reverse
+    if (Test-Path "$scriptDir\llbot.config.json") {
+        Copy-Item "$scriptDir\llbot.config.json" "$llbotDir\config.json" -Force
+    }
+    if (Test-Path "$scriptDir\llbot.default_config.json") {
+        Copy-Item "$scriptDir\llbot.default_config.json" "$llbotDir\bin\llbot\default_config.json" -Force
+    }
+    # Remove old per-QQ config so it regenerates with ws-reverse enabled
+    $oldConfigs = Get-ChildItem "$llbotDir\bin\llbot\data\config_*.json" -ErrorAction SilentlyContinue
+    if ($oldConfigs) {
+        Write-Host "[LLBot] Updating QQ config..."
+        Remove-Item "$llbotDir\bin\llbot\data\config_*.json" -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "[LLBot] Starting..."
+    Start-Process -FilePath $llbotExe -WorkingDirectory $llbotDir
+    Write-Host "[LLBot] Waiting for injection and login (15s)..."
+    Start-Sleep -Seconds 15
+} elseif ($llbotRunning) {
+    Write-Host "[LLBot] Already running"
+} else {
+    Write-Host "[Hint] LLBot not found, skipping QQ bridge" -ForegroundColor Yellow
+    Write-Host "       Download: https://github.com/LLOneBot/LuckyLilliaBot/releases"
+}
+
+# === Start bot ===
+Write-Host "[Start] Launching bot..."
+Write-Host "============================================"
+Write-Host "  Bot running - DO NOT CLOSE this window"
+Write-Host "============================================"
+Write-Host ""
 & $pythonCmd -u bot.py
-pause
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "[Error] Bot exited with code $LASTEXITCODE" -ForegroundColor Red
+    Write-Host "Common causes:"
+    Write-Host "  1. Port 8080 in use - close other programs"
+    Write-Host "  2. API key not set or invalid in .env"
+    Write-Host "  3. Missing dependencies - run: pip install -e ."
+    Write-Host ""
+}
+Read-Host "Press Enter to exit"
