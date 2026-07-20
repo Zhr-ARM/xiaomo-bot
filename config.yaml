@@ -14,12 +14,14 @@ bot:
   persona_version: 2
 
 llm:
-  provider: "deepseek"
-  api_base: "${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}"
-  api_key: "${DEEPSEEK_API_KEY:-}"
-  model: "${DEEPSEEK_MODEL:-deepseek-chat}"
+  provider: "mimo"
+  api_base: "${LLM_API_BASE:-https://api.xiaomimimo.com/v1}"
+  api_key: "${LLM_API_KEY:-}"
+  model: "${LLM_MODEL:-mimo-v2.5}"
   max_tokens: 4096
-  temperature: 0.8
+  temperature: 0.75
+  timeout_seconds: 30
+  max_retries: 0
 
 vision:
   provider: "mimo"
@@ -32,6 +34,41 @@ vision:
 
 weather:
   target_group: "1056259135"
+
+# 联网搜索 (Tavily Search API)
+web_search:
+  api_key: "${TAVILY_API_KEY:-}"
+  max_results: 5
+  search_depth: "basic"        # basic | advanced
+  include_answer: true         # 包含 AI 答案摘要
+  natural_query: true          # 自动检测自然语言问句并搜索
+
+# 主动发言（非 @、非叫小源的自动消息）
+proactive:
+  ai_gate_enabled: true        # 主动发言前先让 LLM 判断是否合适
+  ai_gate_timeout_seconds: 20  # AI 判断超时则跳过这次主动发言
+  quiet_hours:
+    enabled: true
+    start_hour: 23             # 23:00 后不主动发言
+    end_hour: 7                # 07:00 前不主动发言
+
+# 主动插话机会评分（非 @ 时只在合适空位短接一句）
+proactive_join:
+  enabled: true
+  min_cooldown_seconds: 360
+  window_seconds: 1.2
+  probability:
+    react: 0.22
+    short_reply: 0.50
+    helpful_reply: 0.76
+
+# 类人化回复策略（显式 @ 或叫小源后的正式回复前置判断）
+humanize:
+  enabled: true
+  strategy_llm_for_explicit: false # 明确 @/to_me 不额外调用策略 LLM，保证响应速度
+  explicit_max_delay_seconds: 0.3 # 明确 @ 后最多只额外等 0.3 秒再开始请求 LLM
+  strategy_timeout_seconds: 12  # 策略判断超时则走本地回退策略
+  max_extra_delay_seconds: 5    # 策略允许添加的最大额外等待
 
 memory:
   weight_half_life_minutes: 60
@@ -47,6 +84,7 @@ vector:
 silent_window:
   private_seconds: 3
   group_seconds: 5
+  explicit_group_seconds: 0.8    # 明确 @/to_me 的快速响应窗口；普通群聊仍保留 5 秒合并
 
 auto_action:
   bubble_inactive_minutes: 30
@@ -61,6 +99,26 @@ output:
 safety:
   enabled: true
   blocklist_file: "data/blocklist.txt"
+
+# 自动戳戳：特定成员说话时主动戳
+# match_by: "qq" 按 QQ 号精确匹配；"nickname" 按 QQ 昵称包含匹配（大小写不敏感）
+# cooldown_minutes: 同一目标两次戳的最小间隔
+auto_poke_targets:
+  - name: "文姐"        # QQ 昵称中包含"文姐"即匹配
+    match_by: "nickname"
+    cooldown_minutes: 5
+  - name: "1458741024"  # reason 本人
+    match_by: "qq"
+    cooldown_minutes: 5
+
+# 通用戳戳：任何人发言，每隔 N 分钟戳一次（0 = 关闭）
+poke_everyone_cooldown_minutes: 30
+
+# 主动戳戳：遇到感兴趣的话题时戳一下发言者
+poke_topic:
+  probability: 0.20          # 每次检测到有趣话题时触发戳戳的概率
+  user_cooldown_hours: 6.0   # 同一群友至少隔 N 小时才能再戳
+  group_cooldown_seconds: 300  # 同群两次戳戳至少隔 N 秒
 
 # 弔图语录 / 关键词反应
 reactions:

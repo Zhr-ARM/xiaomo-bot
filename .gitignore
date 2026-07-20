@@ -33,6 +33,9 @@ src/*.egg-info/
 # 天气缓存
 data/weather_test.txt
 
+# 调试残留
+data/_debug_segments.json
+
 # NapCat 下载工具残留
 data/napcat_release.json
 

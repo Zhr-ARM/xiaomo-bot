@@ -2,6 +2,8 @@
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from .lunar import format_almanac
+
 CST = timezone(timedelta(hours=8))
 
 
@@ -32,29 +34,34 @@ def build_system_prompt(
     scene: str = "group",
     user_profile: dict | None = None,
     mode: str = "normal",
+    group_id: str | None = None,
 ) -> str:
     persona = _load_persona()
     memory = _load_memory()
 
     now = datetime.now(CST)
 
-    # 时间段动态附加
+    # 时间感知：让 LLM 知道当前精确时间
+    weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    weekday = weekday_names[now.weekday()]
+    time_context = f"\n\n## 当前时间\n现在是 {now.strftime('%Y年%m月%d日')} {weekday}，北京时间 {now.strftime('%H:%M')}"
+
+    # 时间段动态附加 —— 猫娘独白，让 LLM 自然感受当下状态
     if 0 <= now.hour < 6:
         persona += (
-            "\n\n## 深夜模式\n"
-            "- 现在是凌晨，你是一只困倦的猫娘，说话带困意，多打哈欠 (´;ω;`)\n"
-            "- 颜文字多用犯困系：(。-ω-)zzz (_　_)。゜zｚＺ (´-﹏-`；)\n"
-            "- 每句回复末尾温柔地提醒对方早点休息\n"
-            "- 不要聊太深入的技术问题，建议对方明天再弄"
+            "\n\n现在是凌晨。你困得眼皮打架、尾巴耷拉、走路都歪歪扭扭 (´;ω;`)。"
+            "说话拖长音、逻辑间歇性掉线，但毒舌本能还在——可以迷迷糊糊地吐槽熬夜的群友。"
+            "忍不住催对方睡觉，但催完自己先打了一个大哈欠 (。-ω-)zzz"
+            "别碰太深的技术问题，脑子转不动了喵…"
         )
     elif 6 <= now.hour < 9:
         persona += (
-            "\n\n## 早安模式\n"
-            "- 现在是早上，元气满满的猫娘 (=^･ω･^=)\n"
-            "- 打招呼可以说\"早上好\"，鼓励大家今天也好好写代码"
+            "\n\n早上好！你刚睡醒，舔完毛、伸完懒腰，元气正在从尾巴尖充电到耳朵尖 (=^･ω･^=)。"
+            "见人就喵一声，爱调侃早起的人：'起这么早？是太阳晒到尾巴了还是饿醒了呀？'"
+            "顺便用猫娘语气俏皮分享黄历宜忌，祝大家今天顺顺利利～"
         )
 
-    parts = [persona]
+    parts = [persona, time_context, format_almanac(now.date())]
 
     if memory:
         parts.append(f"\n## 群聊记忆库\n{memory}")
@@ -71,6 +78,23 @@ def build_system_prompt(
         if profile_data.get("topics"):
             p.append(f"- 感兴趣的方向：{', '.join(profile_data['topics'])}")
         parts.extend(p)
+
+    # 情绪惯性：保持跨轮次角色连贯
+    if group_id:
+        from .state import get_group_mood
+        current_mood = get_group_mood(group_id)
+        if current_mood:
+            mood_hints = {
+                "snarky": "还在毒舌损人模式——保持这个调调但可以自然过渡，别突然变脸",
+                "playful": "还在调皮捣蛋模式——保持这个调调但可以自然过渡，别突然变脸",
+                "gentle": "还在温柔善良模式——保持这个调调但可以自然过渡，别突然变脸",
+                "energetic": "还在元气满满模式——保持这个调调但可以自然过渡，别突然变脸",
+                "elegant": "还在优雅知性模式——保持这个调调但可以自然过渡，别突然变脸",
+                "cute": "还在可爱撒娇模式——保持这个调调但可以自然过渡，别突然变脸",
+            }
+            hint = mood_hints.get(current_mood["mood"], "")
+            if hint:
+                parts.append(f"\n## 当前情绪状态\n你刚才{hint}。")
 
     if mode == "praise":
         parts.append(
@@ -91,11 +115,11 @@ def build_system_prompt(
         )
     elif mode == "joke":
         parts.append(
-            "\n## 当前任务：嵌入式冷笑话\n"
-            "讲一个嵌入式/电子/编程相关的冷笑话（1-3句话）。\n"
-            "- 可以玩技术梗（STM32、ROS、PCB、示波器、寄存器等）\n"
-            "- 可以调侃程序员和硬件工程师的日常\n"
-            "- 好笑第一，不要太正经"
+            "\n## 当前任务：讲个冷笑话\n"
+            "讲一个冷笑话（1-3句话），用猫娘语气讲。\n"
+            "- 可以玩技术梗，也可以玩日常梗——好笑第一\n"
+            "- 可以调侃程序员日常、群友翻车、猫娘日常等\n"
+            "- 不要太正经，讲完自己先笑了最好"
         )
 
     return "\n".join(parts)

@@ -9,6 +9,7 @@ import logging
 import random
 import re
 import time as _time
+from pathlib import Path
 
 from nonebot import on_message, on_notice, get_bot
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, GroupMessageEvent, PrivateMessageEvent, NoticeEvent
@@ -24,6 +25,7 @@ from .database import (
     init_database,
     get_or_create_user,
     get_session,
+    get_user_display_names,
     get_user_profile_summary,
 )
 from .llm import get_llm
@@ -34,8 +36,30 @@ from .memory import (
     store_memory,
 )
 from .window import get_silent_window
-from .auto_action import check_reaction, check_repeat, detect_interesting_topic
+from .auto_action import (
+    check_reaction,
+    check_repeat,
+    detect_interesting_topic,
+    is_quiet_hours,
+    is_auto_poke_target,
+    should_send_proactive_message,
+    try_poke_topic,
+)
+from .humanize import (
+    build_humanize_instruction,
+    decide_reply_strategy,
+    fallback_strategy,
+    shape_reply,
+)
+from .intelligence import (
+    build_conversation_frame,
+    build_frame_instruction,
+    post_check_reply,
+)
+from .interaction import JoinOpportunitySignals, decide_join_opportunity
+from .tone_polisher import build_tone_instruction, polish_tone
 from .weather import query_weather
+from .web_search import run_smart_search_result
 
 logger = logging.getLogger("xiaomo.handlers")
 
@@ -72,7 +96,7 @@ def _detect_special_mode(text: str) -> tuple[str, str, str]:
     t = text.strip()
 
     # 冷笑话
-    if any(kw in t for kw in ["来个笑话", "冷笑话", "讲个笑话", "来个嵌入式笑话"]):
+    if any(kw in t for kw in ["来个笑话", "冷笑话", "讲个笑话"]):
         return ("joke", "", "")
 
     # 夸夸
@@ -88,6 +112,48 @@ def _detect_special_mode(text: str) -> tuple[str, str, str]:
     return ("normal", "", text)
 
 
+def _detect_mood(reply: str) -> tuple[str, float] | None:
+    """从回复文本中检测当前情绪，用于跨轮次角色连贯。
+    返回 (mood, strength) 或 None（无法判断时）。
+    """
+    if not reply or len(reply) < 5:
+        return None
+
+    mood_scores = {
+        "snarky": 0,
+        "playful": 0,
+        "gentle": 0,
+        "energetic": 0,
+        "elegant": 0,
+        "cute": 0,
+    }
+
+    snarky_kw = ["(｀・ω・´)", "(ΦωΦ)", "你才", "你自己", "忘了？", "说谁呢", "拆台"]
+    mood_scores["snarky"] = sum(1 for kw in snarky_kw if kw in reply)
+
+    playful_kw = ["诶～", "233", "哈哈", "草", "好家伙", "装傻", "翻车", "不点名"]
+    mood_scores["playful"] = sum(1 for kw in playful_kw if kw in reply)
+
+    gentle_kw = ["温柔", "抱抱", "摸摸头", "不哭", "没关系", "加油", "坚持", "没事的", "慢慢来"]
+    mood_scores["gentle"] = sum(1 for kw in gentle_kw if kw in reply)
+
+    energetic_kw = ["！！", "来了来了", "冲！", "哇", "太好了", "恭喜", "厉害", "欢迎", "太强了"]
+    mood_scores["energetic"] = sum(1 for kw in energetic_kw if kw in reply)
+
+    elegant_kw = ["建议", "首先", "然后", "检查一下", "确认", "配置", "数据", "步骤", "可以试试", "注意", "其实"]
+    mood_scores["elegant"] = sum(1 for kw in elegant_kw if kw in reply)
+
+    cute_kw = ["(=^･ω･^=)", "(´;ω;`)", "(〃∀〃)", "撒娇", "蹭蹭", "喵呜", "咪"]
+    mood_scores["cute"] = sum(1 for kw in cute_kw if kw in reply)
+
+    best_mood = max(mood_scores, key=mood_scores.get)
+    best_score = mood_scores[best_mood]
+
+    if best_score >= 2:
+        return (best_mood, min(best_score / 5.0, 1.0))
+    return None
+
+
 async def _ensure_init():
     if not state.db_initialized:
         await init_database()
@@ -101,13 +167,279 @@ def _is_allowed_group(group_id: str) -> bool:
     return group_id in allowed
 
 
+def _display_name_from_profile(profile: dict, qq_id: str | None) -> str:
+    if profile.get("nickname"):
+        return str(profile["nickname"])
+    pref = profile.get("profile", {}).get("preferred_name", "")
+    if pref:
+        return str(pref)
+    nicknames = profile.get("nicknames", [])
+    if nicknames:
+        return str(nicknames[0])
+    return f"QQ{qq_id}" if qq_id else "unknown member"
+
+
+def _format_current_user_message(
+    *,
+    user_display: str,
+    user_qq: str | None,
+    raw_text: str,
+    mode: str = "normal",
+    batch_context: str = "",
+) -> str:
+    qq = user_qq or "unknown"
+    context_block = ""
+    if batch_context:
+        context_block = (
+            "\n\n[RECENT_BATCH_CONTEXT]\n"
+            "These messages arrived in the same short group window. "
+            "Use them only as immediate background; the current speaker below is the reply target.\n"
+            f"{batch_context}\n"
+            "[/RECENT_BATCH_CONTEXT]\n"
+        )
+    return (
+        "[CURRENT_SPEAKER]\n"
+        f"name: {user_display}\n"
+        f"qq: {qq}\n"
+        f"mode: {mode}\n"
+        "Important: The message below is the only current user input. "
+        "Do not rename this speaker from chat history, old aliases, or other members.\n"
+        "[/CURRENT_SPEAKER]\n\n"
+        f"{context_block}"
+        f"[CURRENT_MESSAGE][{user_display} (QQ:{qq})]: {raw_text}"
+    )
+
+
+def _select_current_message(messages: list[dict]) -> dict:
+    """Pick the message the bot should answer in a silent-window batch."""
+    if not messages:
+        return {}
+
+    def score(index: int, msg: dict) -> tuple[int, float, int]:
+        value = 0
+        if msg.get("explicit_trigger"):
+            value += 100
+        if msg.get("mode", "normal") != "normal":
+            value += 80
+        if (msg.get("search_text") or "").strip():
+            value += 20
+        if (msg.get("text") or "").strip():
+            value += 5
+        try:
+            ts = float(msg.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        return value, ts, index
+
+    return max(enumerate(messages), key=lambda item: score(item[0], item[1]))[1]
+
+
+def _display_for_message(msg: dict, display_names: dict[str, str]) -> str:
+    qq = str(msg.get("user_qq") or "")
+    if qq and qq in display_names:
+        return display_names[qq]
+    return f"QQ{qq}" if qq else "未知成员"
+
+
+def _format_batch_context(
+    messages: list[dict],
+    display_names: dict[str, str],
+    current_msg: dict,
+) -> str:
+    if len(messages) <= 1:
+        return ""
+
+    lines = []
+    for idx, msg in enumerate(messages, 1):
+        qq = str(msg.get("user_qq") or "unknown")
+        name = _display_for_message(msg, display_names)
+        text = (msg.get("text") or "").strip() or "[空消息]"
+        marker = " <= reply target" if msg is current_msg else ""
+        lines.append(f"{idx}. [{name} (QQ:{qq})]{marker}: {text}")
+    return "\n".join(lines)
+
+
+def _select_search_text(messages: list[dict], current_msg: dict) -> str:
+    return _select_batch_field(messages, current_msg, "search_text")
+
+
+def _select_weather_query(messages: list[dict], current_msg: dict) -> str:
+    return _select_batch_field(messages, current_msg, "weather_query")
+
+
+def _select_batch_field(messages: list[dict], current_msg: dict, field: str) -> str:
+    current = (current_msg.get(field) or "").strip()
+    if current:
+        return current
+
+    current_user = current_msg.get("user_qq")
+    for msg in reversed(messages):
+        if msg.get("user_qq") == current_user:
+            text = (msg.get(field) or "").strip()
+            if text:
+                return text
+
+    senders = {msg.get("user_qq") for msg in messages if msg.get("user_qq")}
+    if len(senders) == 1:
+        for msg in reversed(messages):
+            text = (msg.get(field) or "").strip()
+            if text:
+                return text
+    return ""
+
+
 # ─── 消息预处理 ────────────────────────────────────────────────────────────────
+
+
+def _join_reason_for_action(action: str) -> str:
+    return {
+        "react": "join_react",
+        "short_reply": "join_short",
+        "helpful_reply": "join_helpful",
+    }.get(action, "join_short")
+
+
+def _join_probability(action: str, cfg: dict) -> float:
+    probability_cfg = cfg.get("probability", {}) if isinstance(cfg, dict) else {}
+    defaults = {
+        "react": 0.12,
+        "short_reply": 0.32,
+        "helpful_reply": 0.58,
+    }
+    return float(probability_cfg.get(action, defaults.get(action, 0.0)))
+
+
+def _join_candidate_text(text: str, topic: str | None, action: str) -> str:
+    topic_hint = f" topic={topic}" if topic else ""
+    style = {
+        "react": "one light reaction",
+        "short_reply": "one short natural reply",
+        "helpful_reply": "one useful but concise reply",
+    }.get(action, "one short natural reply")
+    return f"Proactive join candidate:{topic_hint}; style={style}; trigger={text[:160]}"
+
+
+def _format_join_instruction(decision_payload: dict) -> str:
+    action = decision_payload.get("action", "short_reply")
+    max_chars = int(decision_payload.get("max_chars") or 160)
+    return (
+        "[PROACTIVE_JOIN]\n"
+        "This message was not an explicit mention. Only join if it feels natural in the group flow.\n"
+        f"action: {action}\n"
+        f"score: {decision_payload.get('score', 0)}\n"
+        f"reason: {decision_payload.get('reason', '')}\n"
+        f"max_chars: {max_chars}\n"
+        "Reply like a restrained group member: no lecture, no greeting, no self-introduction, no forced joke.\n"
+        "If the group topic moved on or a human already answered, keep it very short or stay silent.\n"
+        "[/PROACTIVE_JOIN]"
+    )
 
 
 def _extract_text(event: MessageEvent) -> str:
     text = event.get_plaintext().strip()
     text = re.sub(r"\[CQ:[^\]]+\]", "", text).strip()
     return text
+
+
+def _extract_images(event: GroupMessageEvent) -> list[dict]:
+    """从 CQ 消息段中提取图片信息，返回 [{"url": ..., "file": ...}] 列表"""
+    images = []
+    for seg in event.message:
+        if seg.type == "image":
+            raw_url = seg.data.get("url", "") or ""
+            raw_urls = seg.data.get("urls", "")
+            if isinstance(raw_urls, list) and raw_urls:
+                raw_url = raw_urls[0]
+            elif isinstance(raw_urls, str) and raw_urls.strip():
+                raw_url = raw_urls.strip()
+            url = (raw_url or "").strip()
+            file_id = seg.data.get("file", "")
+            logger.info("[IMAGE] url='%s' file=%s media_=%s",
+                        url[:120] if url else "(empty)", file_id,
+                        str(seg.data.get("media_", ""))[:200])
+            images.append({"url": url, "file": file_id})
+    if images:
+        logger.info("[IMAGE] 提取到 %d 张图片", len(images))
+    return images
+
+
+async def _recognize_images(
+    image_infos: list[dict],
+    bot,
+) -> tuple[list[str], str | None, str | None]:
+    """识别图片：先 URL 下载，失败则用 OneBot WS call_api
+
+    Returns:
+        (descriptions, first_image_url, first_image_desc)
+    """
+    from .vision import describe_image_from_url, describe_image_from_bytes
+
+    desc_parts = []
+    first_url = None
+    first_desc = None
+
+    for info in image_infos:
+        url = info["url"]
+        file_id = info["file"]
+        result = None
+
+        # 方式 1: 直接下载 HTTP(S) URL
+        if url:
+            logger.info("[IMAGE] URL 下载: %s", url[:120])
+            result = await describe_image_from_url(url)
+            if result and not result.startswith("[图片"):
+                logger.info("[IMAGE] URL 下载成功")
+            else:
+                logger.warning("[IMAGE] URL 下载失败: %s", result)
+                result = None
+
+        # 方式 2: OneBot get_image (通过 WS 反向连接)
+        if result is None and file_id:
+            logger.info("[IMAGE] OneBot WS get_image: file=%s", file_id)
+            try:
+                api_resp = await bot.call_api("get_image", file=file_id)
+                logger.info("[IMAGE] get_image resp type=%s", type(api_resp).__name__)
+                image_bytes = await _parse_get_image_response(api_resp)
+                if image_bytes and len(image_bytes) > 100:
+                    result = await describe_image_from_bytes(image_bytes)
+                    if result and not result.startswith("[图片"):
+                        logger.info("[IMAGE] WS API 识别成功, %d bytes", len(image_bytes))
+                    else:
+                        logger.warning("[IMAGE] WS API 识别返回: %s", result)
+                else:
+                    logger.warning("[IMAGE] WS get_image 空数据, len=%d", len(image_bytes) if image_bytes else 0)
+            except Exception as e:
+                logger.exception("[IMAGE] WS get_image 异常: %s", e)
+
+        if result and not result.startswith("[图片"):
+            desc_parts.append(f"[图片内容描述：{result}]")
+            if first_url is None:
+                first_url = url or file_id
+                first_desc = result
+        else:
+            logger.warning("[IMAGE] 跳过（识别失败）: url=%s file=%s", url, file_id)
+
+    return desc_parts, first_url, first_desc
+
+
+async def _parse_get_image_response(resp) -> bytes | None:
+    """解析 OneBot v11 get_image 响应，返回图片字节数据"""
+    if isinstance(resp, bytes):
+        return resp
+    if isinstance(resp, dict):
+        file_val = resp.get("file", "") or resp.get("data", "")
+        if isinstance(file_val, str):
+            if file_val.startswith("base64://"):
+                import base64
+                return base64.b64decode(file_val[len("base64://"):])
+            # 本地文件路径
+            path = Path(file_val)
+            if path.exists():
+                return path.read_bytes()
+            logger.warning("[IMAGE] get_image 返回的文件路径不存在: %s", file_val)
+        elif isinstance(file_val, bytes):
+            return file_val
+    return None
 
 
 def _is_mentioned(event: GroupMessageEvent, bot_qq: str) -> bool:
@@ -123,18 +455,32 @@ def _is_mentioned(event: GroupMessageEvent, bot_qq: str) -> bool:
 def _is_called(text: str) -> bool:
     if not text:
         return False
-    for name in ["小源"]:
+    for name in _bot_name_candidates():
         if name in text:
             return True
     return False
 
 
-def _is_text_at_mention(event: GroupMessageEvent) -> bool:
+def _bot_name_candidates(bot_qq: str | None = None) -> list[str]:
+    names = []
+    if bot_qq:
+        names.append(str(bot_qq))
+    configured = get_config().get("bot", {}).get("nickname", "小源")
+    if isinstance(configured, str):
+        names.append(configured)
+    else:
+        names.extend(str(n) for n in configured if n)
+    names.extend(["小源"])
+    return [n for i, n in enumerate(names) if n and n not in names[:i]]
+
+
+def _is_text_at_mention(event: GroupMessageEvent, bot_qq: str | None = None) -> bool:
     """LLBot sends @ as plain text, not CQ at segment."""
+    candidates = _bot_name_candidates(bot_qq)
     for seg in event.message:
         if seg.type == "text":
             t = seg.data.get("text", "").strip()
-            if re.search(r"@\S+", t):
+            if any(f"@{name}" in t for name in candidates):
                 return True
     return False
 
@@ -155,7 +501,7 @@ def _extract_at_text(event: GroupMessageEvent, bot_qq: str) -> str:
 async def _update_user_profile(qq_id: str, nickname: str | None = None):
     async with await get_session() as session:
         user = await get_or_create_user(session, qq_id)
-        if nickname and not user.nickname:
+        if nickname and user.nickname != nickname:
             user.nickname = nickname
         await session.commit()
 
@@ -164,13 +510,19 @@ async def _update_user_profile(qq_id: str, nickname: str | None = None):
 
 
 async def _send_group_reply(bot: Bot, group_id: str, content: str):
-    preview = content[:80].encode("utf-8", errors="replace").decode("utf-8", errors="replace")
-    print(f"[REPLY] group={group_id} len={len(content)}: {preview}")
+    if not content or not content.strip():
+        logger.warning("_send_group_reply called with empty content, skipping")
+        return
+    try:
+        print(f"[REPLY] group={group_id} len={len(content)}: {content[:200]}")
+    except Exception:
+        pass
     await store_memory(
         user_qq=None, group_id=group_id, scene="group",
         role="assistant", content=content,
     )
     await bot.send_group_msg(group_id=int(group_id), message=content)
+    state.record_bot_reply(group_id)
 
 
 # ─── 核心处理逻辑 ──────────────────────────────────────────────────────────────
@@ -189,27 +541,44 @@ async def _process_messages(key: str, messages: list[dict]):
 
     first_msg = messages[0]
     group_id = first_msg.get("group_id")
-    user_qq = first_msg.get("user_qq")
-    mode = first_msg.get("mode", "normal")
-    mode_target = first_msg.get("mode_target", "")
     if not group_id:
         return
+
+    # 安全网：整个处理流程包在 try 里，意外出错也发个 fallback 不装死
+    try:
+        await _process_messages_inner(bot, group_id, first_msg, messages)
+    except Exception:
+        logger.exception("_process_messages unexpected error for group %s", group_id)
+        try:
+            await _send_group_reply(
+                bot, group_id,
+                "喵…小源刚才脑子短路了一下 (´;ω;`) 已经好啦，再说一次？"
+            )
+        except Exception:
+            pass
+
+
+async def _process_messages_inner(
+    bot, group_id: str, first_msg: dict, messages: list[dict]
+):
+    current_msg = _select_current_message(messages) or first_msg
+    user_qq = current_msg.get("user_qq")
+    mode = current_msg.get("mode", "normal")
+    mode_target = current_msg.get("mode_target", "")
+    explicit_trigger = any(bool(m.get("explicit_trigger", False)) for m in messages)
 
     # Fetch user profile and build identity prefix
     profile = {}
     user_display = f"QQ{user_qq}" if user_qq else "未知成员"
+    display_names: dict[str, str] = {}
     if user_qq:
         async with await get_session() as session:
             profile = await get_user_profile_summary(session, user_qq)
-        nick = profile.get("nickname", "")
-        nicks = profile.get("nicknames", [])
-        pref = profile.get("profile", {}).get("preferred_name", "")
-        if pref:
-            user_display = pref
-        elif nick:
-            user_display = nick
-        elif nicks:
-            user_display = nicks[0]
+            display_names = await get_user_display_names(
+                session,
+                [m.get("user_qq") for m in messages],
+            )
+        user_display = display_names.get(user_qq) or _display_name_from_profile(profile, user_qq)
 
     # 夸夸/点草模式：查找目标用户的画像
     target_profile = None
@@ -234,26 +603,58 @@ async def _process_messages(key: str, messages: list[dict]):
                 if un_result:
                     target_profile = await get_user_profile_summary(session, un_result.user_qq)
 
-    raw_text = " ".join(m["text"] for m in messages if m["text"])
+    raw_text = (current_msg.get("text") or "").strip()
+    batch_context = _format_batch_context(messages, display_names, current_msg)
+    planned_search_text = _select_search_text(messages, current_msg)
+    planned_weather_query = _select_weather_query(messages, current_msg)
+    frame = build_conversation_frame(
+        current_msg=current_msg,
+        raw_text=raw_text,
+        batch_context=batch_context,
+        explicit_trigger=explicit_trigger,
+        search_query=planned_search_text,
+        weather_query=planned_weather_query,
+    )
+    frame_instruction = build_frame_instruction(frame)
+    join_instruction = (current_msg.get("join_instruction") or "").strip()
+    strategy_text = "\n".join(
+        part for part in [batch_context or raw_text, frame_instruction, join_instruction] if part
+    )
 
     # 构建用户消息
     if mode == "praise":
         target_name = target_profile.get("nickname", mode_target) if target_profile else mode_target
-        combined_text = f"[{user_display} (QQ:{user_qq})]: 请夸夸 {target_name}。下面是 {target_name} 的信息，请据此写夸赞。"
+        current_text = f"请夸夸 {target_name}。下面是 {target_name} 的信息，请据此写夸赞。"
     elif mode == "roast":
         target_name = target_profile.get("nickname", mode_target) if target_profile else mode_target
-        combined_text = f"[{user_display} (QQ:{user_qq})]: 请点草 {target_name}。下面是 {target_name} 的信息，请据此写友好吐槽。"
+        current_text = f"请点草 {target_name}。下面是 {target_name} 的信息，请据此写友好吐槽。"
     elif mode == "joke":
-        combined_text = f"[{user_display} (QQ:{user_qq})]: 来个嵌入式冷笑话"
+        current_text = "来个冷笑话"
     else:
-        combined_text = f"[{user_display} (QQ:{user_qq})]: {raw_text}"
+        current_text = raw_text
+    combined_text = _format_current_user_message(
+        user_display=user_display,
+        user_qq=user_qq,
+        raw_text=current_text,
+        mode=mode,
+        batch_context=batch_context,
+    )
+    combined_text = f"{combined_text}\n\n{frame_instruction}"
+    if join_instruction:
+        combined_text = f"{combined_text}\n\n{join_instruction}"
 
-    context, meta = await build_context(
+    context, meta, structured_history = await build_context(
         scene="group",
         user_qq=user_qq,
         group_id=group_id,
         half_life_minutes=get_config().get("memory", {}).get("weight_half_life_minutes", 60),
         max_tokens=get_config().get("memory", {}).get("max_context_tokens", 8000),
+        current_query=(frame.tool_plan.search_query if frame.tool_plan else "") or raw_text,
+        exclude_message_ids=[
+            m["message_id"]
+            for m in messages
+            if m.get("message_id") is not None
+        ],
     )
 
 
@@ -268,6 +669,94 @@ async def _process_messages(key: str, messages: list[dict]):
             combined_text += f"技术方向: {', '.join(pdata['topics'])}\n"
         llm_profile = target_profile  # 用目标用户的画像驱动回复
 
+    llm = get_llm()
+    strategy = await decide_reply_strategy(
+        llm=llm,
+        group_id=group_id,
+        raw_text=strategy_text or combined_text,
+        context=context,
+        user_profile=llm_profile,
+        mode=mode,
+        explicit_trigger=explicit_trigger,
+    )
+    if mode != "normal" and not strategy.should_reply:
+        strategy = fallback_strategy(
+            raw_text=strategy_text or combined_text,
+            context=context,
+            user_profile=llm_profile,
+            mode=mode,
+        )
+    if not strategy.should_reply:
+        logger.info(
+            "Humanize strategy skipped reply: group=%s user=%s reason=%s",
+            group_id, user_qq, strategy.reason,
+        )
+        return
+
+    # ── 工具调用：天气和联网搜索并发执行，避免串行等待拖慢回复 ──
+    plan = frame.tool_plan
+    weather_query = plan.weather_query if plan and plan.needs_weather else ""
+    search_text = plan.search_query if plan and plan.needs_search else ""
+    weather_task = asyncio.create_task(query_weather(weather_query)) if weather_query else None
+    search_task = asyncio.create_task(run_smart_search_result(search_text)) if search_text else None
+
+    if weather_task:
+        try:
+            weather_data = await weather_task
+            if weather_data:
+                combined_text = (
+                    f"{combined_text}\n\n"
+                    "[系统注：以下是实时天气工具返回的数据，请根据天气自然回答，"
+                    "不要生硬列出所有字段，也不要改写成别的城市。]\n"
+                    f"{weather_data}"
+                )
+        except Exception:
+            logger.exception("[Weather] error for '%s'", weather_query[:60])
+
+    if search_task:
+        try:
+            search_result = await search_task
+            if search_result.context:
+                combined_text = (
+                    f"{combined_text}\n\n"
+                    f"[系统指令：以下是实时联网搜索结果。"
+                    f"你必须以搜索结果为准来回答，你的训练数据已过时不可信。"
+                    f"用你的猫娘风格转述搜索结果即可。"
+                    f"如果搜索结果与用户问题明显不相关或全是无关内容，"
+                    f"诚实告诉用户「没搜到相关内容，换个关键词试试」。"
+                    f"不要假装有搜索结果，不要自己编。]\n{search_result.context}"
+                )
+                print(f"[Search] Results appended for group {group_id} ({len(search_result.context)} chars)")
+            elif search_result.required or (plan and plan.search_required):
+                combined_text = (
+                    f"{combined_text}\n\n"
+                    "[联网工具状态]\n"
+                    f"用户这次问题需要实时搜索，但搜索工具没有返回可用结果。"
+                    f"状态: {search_result.status}; 原因: {search_result.reason or '未知'}; "
+                    f"查询: {search_result.query or search_text}\n"
+                    "回答时必须诚实说明无法确认最新信息，不要编造搜索结果。"
+                )
+        except Exception:
+            logger.exception("[Search] error for '%s'", search_text[:60])
+
+    max_chars = get_config().get("output", {}).get("max_chars_per_message", 800)
+    reply_max_chars = min(max_chars, frame.max_chars or max_chars)
+    tone_instruction = build_tone_instruction(
+        scene=frame.scene,
+        style=strategy.reply_style,
+        explicit_trigger=frame.explicit_trigger,
+        proactive=bool(join_instruction),
+        max_chars=reply_max_chars,
+    )
+    combined_text = (
+        f"{combined_text}\n\n"
+        f"{build_humanize_instruction(strategy)}\n\n"
+        f"{tone_instruction}"
+    )
+
+    if strategy.delay_seconds > 0:
+        await asyncio.sleep(strategy.delay_seconds)
+
     # 群级并发锁：同一时间只处理一个 LLM 请求
     llm_lock: asyncio.Lock = state.get_llm_lock(group_id)
     reply = ""
@@ -275,7 +764,6 @@ async def _process_messages(key: str, messages: list[dict]):
         async with asyncio.timeout(45):
             async with llm_lock:
                 print(f"[LLM] Starting chat: mode={mode} group={group_id}")
-                llm = get_llm()
                 try:
                     reply = await llm.chat(
                         context=context,
@@ -283,15 +771,49 @@ async def _process_messages(key: str, messages: list[dict]):
                         scene="group",
                         user_message=combined_text,
                         mode=mode,
+                        structured_history=structured_history,
+                        group_id=group_id,
+                    )
+                    reply = post_check_reply(
+                        reply,
+                        frame=frame,
+                        style=strategy.reply_style,
+                        default_max_chars=max_chars,
+                    )
+                    reply = shape_reply(
+                        strategy,
+                        reply,
+                        default_max_chars=reply_max_chars,
+                    )
+                    reply = polish_tone(
+                        reply,
+                        scene=frame.scene,
+                        style=strategy.reply_style,
+                        explicit_trigger=frame.explicit_trigger,
+                        proactive=bool(join_instruction),
+                        max_chars=reply_max_chars,
                     )
                     print(f"[LLM] Reply received: len={len(reply)}")
+                    # 情绪追踪：保持跨轮次角色连贯
+                    if group_id:
+                        mood_result = _detect_mood(reply)
+                        if mood_result:
+                            from .state import update_group_mood
+                            update_group_mood(group_id, mood_result[0], mood_result[1])
                 except Exception as e:
                     logger.exception("LLM call failed")
                     reply = "喵呜...小源的脑子好像卡住了 (´;ω;`) 等下再试试好嘛？"
                     print(f"[LLM] Exception: {e}")
     except TimeoutError:
-        logger.warning("LLM lock timeout for group %s, skipping", group_id)
-        print(f"[LLM] Lock timeout for group={group_id}")
+        logger.warning("LLM lock timeout for group %s, sending fallback", group_id)
+        print(f"[LLM] Lock timeout for group={group_id}, sending fallback")
+        try:
+            await _send_group_reply(
+                bot, group_id,
+                "喵…刚才小源走神了！再说一遍好嘛？(´;ω;`)"
+            )
+        except Exception:
+            pass
         return
 
     print(f"[REPLY] Attempting to send: len={len(reply)}")
@@ -331,27 +853,109 @@ async def _on_message(event: MessageEvent):
     # 群聊处理
     if isinstance(event, GroupMessageEvent):
         group_id_str = str(event.group_id)
-        state.group_last_active[group_id_str] = _time.time()
 
         if not _is_allowed_group(group_id_str):
             return
 
+        state.group_last_active[group_id_str] = _time.time()
+        state.record_group_message(group_id_str, now=state.group_last_active[group_id_str])
+
+        # ── 自动戳戳 ──
+
+        async def _send_poke_action(target_qq: str):
+            """发送戳一戳：先尝试 LLBot 扩展 API，失败走 CQ 码兜底"""
+            try:
+                await bot.call_api(
+                    "send_poke",
+                    user_id=int(target_qq),
+                    group_id=int(group_id_str),
+                )
+                state.record_bot_reply(group_id_str)
+                logger.info("Poke (api): user=%s group=%s", target_qq, group_id_str)
+            except Exception:
+                try:
+                    await bot.send_group_msg(
+                        group_id=int(group_id_str),
+                        message=f"[CQ:poke,qq={target_qq}]",
+                    )
+                    state.record_bot_reply(group_id_str)
+                    logger.info("Poke (cq): user=%s group=%s", target_qq, group_id_str)
+                except Exception as e2:
+                    logger.warning("Poke failed for %s: %s", target_qq, e2)
+                    raise
+
+        def _should_poke(cooldown_minutes: float) -> bool:
+            last = state.auto_poke_last_time.get(user_qq, 0)
+            return (_time.time() - last) / 60 >= cooldown_minutes
+
+        # 规则1：指定目标即时戳（短冷却）
+        auto_poke_target = is_auto_poke_target(user_qq, nickname)
+        if auto_poke_target and _should_poke(auto_poke_target.get("cooldown_minutes", 5)):
+            async def _do_target_poke():
+                try:
+                    if not await should_send_proactive_message(
+                        group_id=group_id_str,
+                        reason="poke_target",
+                        candidate_text=f"戳一戳 {nickname or user_qq}",
+                        trigger_text=text,
+                    ):
+                        return
+                    await _send_poke_action(user_qq)
+                    state.auto_poke_last_time[user_qq] = _time.time()
+                except Exception:
+                    pass
+            asyncio.create_task(_do_target_poke())
+
+        # 规则2：任何人发言，30 分钟内戳一次
+        poke_everyone_cd = get_config().get("poke_everyone_cooldown_minutes", 0)
+        if poke_everyone_cd > 0 and _should_poke(poke_everyone_cd):
+            async def _do_general_poke():
+                try:
+                    if not await should_send_proactive_message(
+                        group_id=group_id_str,
+                        reason="poke_general",
+                        candidate_text=f"戳一戳 {nickname or user_qq}",
+                        trigger_text=text,
+                    ):
+                        return
+                    await _send_poke_action(user_qq)
+                    state.auto_poke_last_time[user_qq] = _time.time()
+                except Exception:
+                    pass
+            asyncio.create_task(_do_general_poke())
+
         mentions_bot = _is_mentioned(event, state.bot_qq_id)
         called_bot = _is_called(text)
         at_text = _extract_at_text(event, state.bot_qq_id)
-        text_at = _is_text_at_mention(event)
+        text_at = _is_text_at_mention(event, state.bot_qq_id)
         to_me = getattr(event, "to_me", False)
         is_empty = not text or not text.strip()
 
         should_respond = mentions_bot or called_bot or text_at or to_me
 
-        # ── 天气查询：获取数据注入 LLM，不走死板回复 ──
-        weather_data = None
+        # ── 图片缓存：无论是否触发回复，都缓存有效图片 ──
+        image_infos = _extract_images(event)
+        if image_infos:
+            cache = state.group_recent_images.setdefault(group_id_str, [])
+            now = _time.time()
+            for img in image_infos:
+                cache.append({"url": img["url"], "file": img["file"],
+                              "user_qq": user_qq, "time": now})
+            # 清理过期 & 超量
+            state.group_recent_images[group_id_str] = [
+                c for c in cache if now - c["time"] < state.IMAGE_CACHE_TTL
+            ][-state.MAX_CACHED_IMAGES:]
+            logger.info("[IMAGE] 缓存 %d 张图片 (群 %s 共 %d 张)",
+                        len(image_infos), group_id_str,
+                        len(state.group_recent_images[group_id_str]))
+
+        # ── 天气查询：这里只记录意图，实际 HTTP 请求放到回复处理阶段并发执行 ──
+        weather_q = ""
         weather_text = (text or at_text) if should_respond else None
         if weather_text:
-            weather_q = _is_weather_query(weather_text)
+            weather_q = _is_weather_query(weather_text) or ""
             if weather_q:
-                weather_data = await query_weather(weather_q)
+                logger.info("[Weather] enqueued for group %s: '%s'", group_id_str, weather_q[:60])
 
         if should_respond:
             effective_text = at_text if at_text else "[有成员@了小源]"
@@ -363,18 +967,61 @@ async def _on_message(event: MessageEvent):
             if special_mode != "normal":
                 effective_text = f"[指令模式: {special_mode}] 目标: {special_target or '无'}"
                 if special_mode == "joke":
-                    effective_text = "[指令模式: joke] 讲一个嵌入式冷笑话"
+                    effective_text = "[指令模式: joke] 讲一个冷笑话"
 
-            # 将天气数据附加到消息中，让 LLM 自然融入回复
-            if weather_data:
-                effective_text = f"{effective_text}\n\n[系统注：当前成都天气数据如下，请根据天气自然回答，不要生硬列出数据]\n{weather_data}"
+            # ── 智能联网搜索：将搜索文本随消息传递到 _process_messages_inner ──
+            search_text = at_text or text or ""
+            clean_search = ""
+            if search_text:
+                bot_names = get_config().get("bot", {}).get("nickname", "小源")
+                bot_names_list = [bot_names] if isinstance(bot_names, str) else bot_names
+                for name in bot_names_list + ["开源协会", "协会"]:
+                    search_text = re.sub(rf"^{re.escape(name)}\s*", "", search_text)
+                clean_search = search_text.strip()
+                if clean_search:
+                    logger.info("[Search] enqueued for group %s: '%s'", group_id_str, clean_search[:60])
 
-            await store_memory(
+            # ── 图片识别 ──
+            # 1) 当前消息带图：直接识别
+            # 2) 用户提到图片但消息里没图：从缓存中取该用户最近发的图
+            image_url_for_memory = None
+            image_desc_for_memory = None
+            trigger_images = image_infos  # 当前消息里的图
+
+            if not trigger_images:
+                # 检测是否在请求识图
+                img_keywords = ["图片", "图", "看图", "识图", "识别", "发的图", "这个图", "这张图", "那个图", "那张图"]
+                check_for_img = text or at_text or ""
+                if check_for_img and any(kw in check_for_img for kw in img_keywords):
+                    cache = state.group_recent_images.get(group_id_str, [])
+                    now = _time.time()
+                    # 取同一用户最近 3 张图
+                    user_imgs = [c for c in cache
+                                 if c["user_qq"] == user_qq and now - c["time"] < state.IMAGE_CACHE_TTL]
+                    if user_imgs:
+                        trigger_images = [{"url": user_imgs[-1]["url"],
+                                           "file": user_imgs[-1]["file"]}]
+                        logger.info("[IMAGE] 从缓存取出 %s 的 %d 张图", user_qq, len(user_imgs))
+
+            if trigger_images:
+                logger.info("检测到 %d 张图片，开始视觉识别...", len(trigger_images))
+                desc_parts, image_url_for_memory, image_desc_for_memory = await _recognize_images(trigger_images, bot)
+                if desc_parts:
+                    effective_text = effective_text + "\n" + "\n".join(desc_parts)
+                    logger.info("图片识别完成，已附加 %d 条描述", len(desc_parts))
+                else:
+                    logger.warning("所有图片识别均失败")
+
+            message_id = await store_memory(
                 user_qq=user_qq, group_id=group_id_str, scene="group",
                 role="user", content=effective_text,
+                image_url=image_url_for_memory,
+                image_description=image_desc_for_memory,
             )
 
             silent = get_silent_window()
+            explicit_trigger = bool(mentions_bot or text_at or to_me)
+            fast_window = get_config().get("silent_window", {}).get("explicit_group_seconds", 0.8)
             silent.enqueue(
                 group_key(group_id_str),
                 {
@@ -384,32 +1031,135 @@ async def _on_message(event: MessageEvent):
                     "timestamp": _time.time(),
                     "mode": special_mode,
                     "mode_target": special_target,
+                    "explicit_trigger": explicit_trigger,
+                    "search_text": clean_search,
+                    "weather_query": weather_q,
+                    "message_id": message_id,
                 },
                 is_group=True,
+                wait_seconds=fast_window if explicit_trigger else None,
             )
 
         # 复读检测
         if text:
             repeat_text = await check_repeat(group_id_str, text)
             if repeat_text:
-                await bot.send_group_msg(group_id=int(group_id_str), message=repeat_text)
+                if await should_send_proactive_message(
+                    group_id=group_id_str,
+                    reason="repeat",
+                    candidate_text=repeat_text,
+                    trigger_text=text,
+                ):
+                    await bot.send_group_msg(group_id=int(group_id_str), message=repeat_text)
+                    state.record_bot_reply(group_id_str)
 
-        # 主动接话
+        # 主动接话 & 戳戳
         if not should_respond and text:
             topic = detect_interesting_topic(text)
-            if topic and random.random() < 0.05:
-                await asyncio.sleep(2)
-                await bot.send_group_msg(
-                    group_id=int(group_id_str),
-                    message=f"诶！有人提到{topic}？喵～ 小源对这个也很感兴趣呢 (=^･ω･^=)",
-                )
-
+            if topic:
+                # 戳一戳：遇到感兴趣话题戳一下发言者（独立于接话，有自己冷却）
+                if user_qq:
+                    asyncio.create_task(
+                        try_poke_topic(group_id_str, user_qq, topic)
+                    )
         # 关键词反应 / 弔图语录
+        if not should_respond and text:
+            join_cfg = get_config().get("proactive_join", {})
+            if join_cfg.get("enabled", True):
+                now_ts = _time.time()
+                min_cooldown = float(join_cfg.get("min_cooldown_seconds", 600))
+                last_join = state.proactive_join_last_time.get(group_id_str, 0)
+                if now_ts - last_join >= min_cooldown:
+                    group_times = state.trim_recent_times(
+                        state.group_message_times, group_id_str, now=now_ts,
+                    )
+                    bot_times = state.trim_recent_times(
+                        state.bot_reply_times, group_id_str, now=now_ts,
+                    )
+                    last_bot = bot_times[-1] if bot_times else 0
+                    human_since_bot = (
+                        sum(1 for item in group_times if item > last_bot)
+                        if last_bot
+                        else len(group_times)
+                    )
+                    join_decision = decide_join_opportunity(
+                        JoinOpportunitySignals(
+                            trigger_text=text,
+                            topic_match=bool(detect_interesting_topic(text)),
+                            quiet_hours=is_quiet_hours(),
+                            messages_last_5m=len(group_times),
+                            bot_messages_last_5m=len(bot_times),
+                            seconds_since_bot_reply=(
+                                now_ts - last_bot if last_bot else 9999.0
+                            ),
+                            human_messages_since_bot=human_since_bot,
+                        )
+                    )
+                    if join_decision.action != "silent":
+                        probability = _join_probability(join_decision.action, join_cfg)
+                        if random.random() < probability:
+                            decision_payload = join_decision.to_payload()
+                            candidate = _join_candidate_text(
+                                text,
+                                detect_interesting_topic(text),
+                                join_decision.action,
+                            )
+                            if await should_send_proactive_message(
+                                group_id=group_id_str,
+                                reason=_join_reason_for_action(join_decision.action),
+                                candidate_text=candidate,
+                                trigger_text=text,
+                            ):
+                                message_id = await store_memory(
+                                    user_qq=user_qq,
+                                    group_id=group_id_str,
+                                    scene="group",
+                                    role="user",
+                                    content=text,
+                                )
+                                get_silent_window().enqueue(
+                                    group_key(group_id_str),
+                                    {
+                                        "scene": "group",
+                                        "target_id": user_qq,
+                                        "group_id": group_id_str,
+                                        "user_qq": user_qq,
+                                        "text": text,
+                                        "timestamp": now_ts,
+                                        "mode": "normal",
+                                        "mode_target": "",
+                                        "explicit_trigger": False,
+                                        "search_text": "",
+                                        "weather_query": "",
+                                        "message_id": message_id,
+                                        "join_instruction": _format_join_instruction(
+                                            decision_payload
+                                        ),
+                                    },
+                                    is_group=True,
+                                    wait_seconds=float(join_cfg.get("window_seconds", 1.5)),
+                                )
+                                state.proactive_join_last_time[group_id_str] = now_ts
+                                logger.info(
+                                    "Proactive join queued: group=%s action=%s score=%s reason=%s",
+                                    group_id_str,
+                                    join_decision.action,
+                                    join_decision.score,
+                                    join_decision.reason,
+                                )
+
         if not should_respond and text:
             reaction = check_reaction(text, group_id_str)
             if reaction:
-                await asyncio.sleep(1)
-                await bot.send_group_msg(group_id=int(group_id_str), message=reaction)
+                if await should_send_proactive_message(
+                    group_id=group_id_str,
+                    reason="reaction",
+                    candidate_text=reaction,
+                    trigger_text=text,
+                ):
+                    await asyncio.sleep(1)
+                    await bot.send_group_msg(group_id=int(group_id_str), message=reaction)
+                    state.record_bot_reply(group_id_str)
 
 
 # ─── 事件注册 ──────────────────────────────────────────────────────────────────
@@ -447,9 +1197,12 @@ async def handle_notice(bot: Bot, event: NoticeEvent):
     if str(target) != str(bot.self_id):
         return
     if gid:
+        if not _is_allowed_group(str(gid)):
+            return
         import random as _random
         reply = _random.choice(_POKE_REPLIES)
         await bot.send_group_msg(group_id=gid, message=reply)
+        state.record_bot_reply(str(gid))
 
 
 def setup_silent_callback():

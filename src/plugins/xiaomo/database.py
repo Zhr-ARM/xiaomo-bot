@@ -6,7 +6,7 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from sqlalchemy import (
     Float,
@@ -36,6 +36,9 @@ _session_factory: async_sessionmaker | None = None
 
 async def init_database():
     global _engine, _session_factory
+    if _engine is not None and _session_factory is not None:
+        return
+
     config = get_config()
     db_path = config.get("database_path", "data/xiaomo.db")
     # Ensure absolute path
@@ -62,10 +65,11 @@ async def get_session() -> AsyncSession:
 
 
 async def close_database():
-    global _engine
+    global _engine, _session_factory
     if _engine:
         await _engine.dispose()
-        _engine = None
+    _engine = None
+    _session_factory = None
 
 
 # ─── Models ───────────────────────────────────────────────────────────────────
@@ -295,3 +299,25 @@ async def get_user_profile_summary(session: AsyncSession, qq_id: str) -> dict:
         "profile": user.get_profile(),
         "relationships": relationships,
     }
+
+
+async def get_user_display_names(
+    session: AsyncSession,
+    qq_ids: Iterable[str | None],
+) -> dict[str, str]:
+    """Batch-load stable display names for group context rendering."""
+    ids = sorted({str(q) for q in qq_ids if q})
+    if not ids:
+        return {}
+
+    result = await session.execute(select(User).where(User.qq_id.in_(ids)))
+    users = list(result.scalars().all())
+
+    names: dict[str, str] = {}
+    for user in users:
+        profile = user.get_profile()
+        name = user.nickname or profile.get("preferred_name") or ""
+        if name:
+            names[user.qq_id] = str(name)
+
+    return names

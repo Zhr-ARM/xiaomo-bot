@@ -5,7 +5,7 @@ from nonebot.plugin import PluginMetadata
 __plugin_meta__ = PluginMetadata(
     name="小源",
     description="一只可爱的猫娘QQ聊天机器人 (｡･ω･｡)",
-    usage="私聊直接对话 / 群聊@或叫小源即可触发喵~",
+    usage="仅支持群聊：@小源或叫小源即可触发喵~",
     config=None,
 )
 

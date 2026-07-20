@@ -30,7 +30,9 @@
       },
       {
         "type": "http",
-        "enable": false
+        "enable": true,
+        "host": "127.0.0.1",
+        "port": 3081
       },
       {
         "type": "http-post",
@@ -38,7 +40,7 @@
       }
     ]
   },
-  "enableLocalFile2Url": false,
+  "enableLocalFile2Url": true,
   "log": true,
   "autoDeleteFile": false,
   "autoDeleteFileSecond": 60,

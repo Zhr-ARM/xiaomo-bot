@@ -17,6 +17,7 @@ from .database import (
     Message,
     get_context_messages,
     get_session,
+    get_user_display_names,
     get_user_profile_summary,
     save_message,
 )
@@ -64,7 +65,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def _smart_truncate(
-    messages: list[Message], _max_tokens: int, half_life: float
+    messages: list[Message], max_tokens: int, half_life: float
 ) -> list[Message]:
     """
     智能上下文截断：始终保留最近 N 条，旧消息按权重择优保留。
@@ -83,9 +84,37 @@ def _smart_truncate(
     old_with_weight = [(m, m.current_weight(half_life)) for m in old]
     old_with_weight.sort(key=lambda x: x[1], reverse=True)
 
-    selected = recent + [m for m, _ in old_with_weight]
+    selected: list[Message] = []
+    used_tokens = 0
+
+    def try_add(msg: Message) -> None:
+        nonlocal used_tokens
+        cost = max(1, estimate_tokens(msg.content))
+        if used_tokens + cost <= max_tokens:
+            selected.append(msg)
+            used_tokens += cost
+
+    # 先保留最近消息，再用剩余预算补充高权重旧消息。
+    for msg in recent:
+        try_add(msg)
+    for msg, _ in old_with_weight:
+        try_add(msg)
+
     selected.sort(key=lambda m: m.created_at)
     return selected
+
+
+def _latest_user_content(messages: list[Message], user_qq: str | None) -> str:
+    """获取当前用户最近一条非空用户消息，用作语义搜索 query。"""
+    for msg in sorted(messages, key=lambda m: m.created_at, reverse=True):
+        if msg.role != "user":
+            continue
+        if user_qq and msg.user_qq != user_qq:
+            continue
+        content = (msg.content or "").strip()
+        if content:
+            return content
+    return ""
 
 
 async def build_context(
@@ -94,7 +123,9 @@ async def build_context(
     group_id: str | None = None,
     half_life_minutes: float = 60,
     max_tokens: int = 8000,
-) -> tuple[str, dict]:
+    current_query: str | None = None,
+    exclude_message_ids: list[int] | tuple[int, ...] | set[int] | None = None,
+) -> tuple[str, dict, list[dict]]:
     """
     构建 LLM 上下文：
     - 从数据库加载相关消息
@@ -102,6 +133,15 @@ async def build_context(
     - 压缩旧消息为摘要
     - 返回格式化的上下文
     """
+    excluded_ids: set[int] = set()
+    for mid in exclude_message_ids or []:
+        if mid is None:
+            continue
+        try:
+            excluded_ids.add(int(mid))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid exclude_message_id: %r", mid)
+
     async with await get_session() as session:
         messages = await get_context_messages(
             session,
@@ -111,6 +151,8 @@ async def build_context(
             half_life_minutes=half_life_minutes,
             limit=500,
         )
+        if excluded_ids:
+            messages = [m for m in messages if m.id not in excluded_ids]
 
         # 获取压缩摘要
         summary_stmt = select(ContextSummary).where(ContextSummary.scene == scene)
@@ -143,43 +185,41 @@ async def build_context(
             )
             user_history_result = await session.execute(user_history_stmt)
             user_history = list(user_history_result.scalars().all())
+            if excluded_ids:
+                user_history = [m for m in user_history if m.id not in excluded_ids]
+
+        name_ids = {m.user_qq for m in messages if m.user_qq}
+        name_ids.update(m.user_qq for m in user_history if m.user_qq)
+        if user_qq:
+            name_ids.add(user_qq)
+        user_names = await get_user_display_names(session, name_ids)
 
     # 截断
     messages = _smart_truncate(list(messages), max_tokens, half_life_minutes)
 
-    # 构建上下文文本
-    parts = []
+    # 构建上下文文本和结构化消息历史
+    context_parts: list[str] = []
+    structured_history: list[dict] = []
 
     if summaries:
-        parts.append("[以下是历史对话摘要]\n")
+        context_parts.append("[以下是历史对话摘要]\n")
         for s in summaries:
-            parts.append(s.summary)
-        parts.append("\n[/历史摘要]\n")
-
-    # Build user name lookup for personalized context
-    user_names: dict[str, str] = {}
-    if profile and profile.get("exists"):
-        qq = profile["qq_id"]
-        name = profile.get("nickname", "") or profile.get("profile", {}).get("preferred_name", "")
-        if name:
-            user_names[qq] = name
+            context_parts.append(s.summary)
+        context_parts.append("\n[/历史摘要]\n")
 
     # 分用户记忆：当前说话人的历史发言
     if user_history:
-        parts.append("[以下是该成员近期在本群的发言历史]\n")
+        context_parts.append("[以下是该成员近期在本群的发言历史]\n")
         for m in reversed(user_history):
-            parts.append(f"- {m.content[:300]}")
-        parts.append("\n[/成员发言历史]\n")
+            name = user_names.get(m.user_qq or "", f"用户{m.user_qq}" if m.user_qq else "用户")
+            context_parts.append(f"- [{name}]: {m.content[:300]}")
+        context_parts.append("\n[/成员发言历史]\n")
 
     # 向量语义搜索：查找与当前话题相似的历史消息
     if scene == "group" and group_id:
         try:
             # 用最近的用户消息作为搜索 query
-            latest_user_content = ""
-            for m in messages:
-                if m.role == "user" and m.user_qq == user_qq:
-                    latest_user_content = m.content
-                    break
+            latest_user_content = (current_query or "").strip() or _latest_user_content(messages, user_qq)
             if latest_user_content:
                 from .vector_store import search_similar
                 # 排除最近 10 分钟的消息（已在上下文中）
@@ -192,24 +232,42 @@ async def build_context(
                     min_time=min_age,
                 )
                 if vector_hits:
-                    parts.append("[以下是语义相关的历史讨论（可能有助于回答当前问题）]\n")
+                    missing_names = {
+                        h.get("user_qq")
+                        for h in vector_hits
+                        if h.get("user_qq") and h.get("user_qq") not in user_names
+                    }
+                    if missing_names:
+                        async with await get_session() as session:
+                            user_names.update(await get_user_display_names(session, missing_names))
+                    context_parts.append("[以下是语义相关的历史讨论（可能有助于回答当前问题）]\n")
                     for h in vector_hits:
-                        user_label = f"QQ{h['user_qq']}" if h["user_qq"] else "未知"
-                        parts.append(f"- [{user_label}]: {h['content'][:300]}")
-                    parts.append("\n[/语义相关历史]\n")
+                        user_label = user_names.get(h["user_qq"], f"QQ{h['user_qq']}" if h["user_qq"] else "未知")
+                        context_parts.append(f"- [{user_label}]: {h['content'][:300]}")
+                    context_parts.append("\n[/语义相关历史]\n")
         except Exception:
             pass  # 向量搜索失败不影响主流程
 
     for msg in messages:
         if msg.role == "assistant":
             name = "小源"
+            structured_history.append({"role": "assistant", "content": msg.content})
         elif msg.role == "user":
             name = user_names.get(msg.user_qq or "", f"用户{msg.user_qq}" if msg.user_qq else "用户")
+            structured_history.append({"role": "user", "content": f"[{name}]: {msg.content}"})
         else:
             name = "系统"
-        parts.append(f"[{name}]: {msg.content}")
 
-    return "\n".join(parts), {"profile": profile, "message_count": len(messages)}
+    # 合并连续同角色消息，确保 user/assistant 交替
+    merged_history: list[dict] = []
+    for msg in structured_history:
+        if merged_history and merged_history[-1]["role"] == msg["role"]:
+            merged_history[-1]["content"] += "\n" + msg["content"]
+        else:
+            merged_history.append(msg)
+
+    context_text = "\n".join(context_parts)
+    return context_text, {"profile": profile, "message_count": len(messages)}, merged_history
 
 
 async def store_memory(
@@ -220,7 +278,7 @@ async def store_memory(
     content: str,
     image_url: str | None = None,
     image_description: str | None = None,
-):
+) -> int:
     """存储消息到记忆系统"""
     async with await get_session() as session:
         msg = await save_message(
@@ -249,6 +307,8 @@ async def store_memory(
             )
         except Exception:
             logger.exception("Failed to add to vector store")
+
+    return msg.id
 
 
 async def compress_old_memories(
@@ -314,3 +374,9 @@ async def compress_old_memories(
         compress_ids = [m.id for m in to_compress]
         await session.execute(delete(Message).where(Message.id.in_(compress_ids)))
         await session.commit()
+
+        try:
+            from .vector_store import delete_messages
+            await delete_messages(compress_ids)
+        except Exception:
+            logger.exception("Failed to clean compressed vector memories")

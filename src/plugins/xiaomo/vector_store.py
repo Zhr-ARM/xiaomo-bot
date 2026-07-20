@@ -131,6 +131,19 @@ async def search_similar(
         return []
 
 
+async def delete_messages(message_ids: list[int] | tuple[int, ...] | set[int]):
+    """Remove message embeddings after their source DB rows are compressed/deleted."""
+    if _collection is None or not message_ids:
+        return
+    try:
+        ids = [str(mid) for mid in message_ids if mid is not None]
+        if ids:
+            _collection.delete(ids=ids)
+            logger.info("Deleted %d messages from vector store", len(ids))
+    except Exception:
+        logger.exception("Failed to delete messages from vector store")
+
+
 async def close_vector_store():
     global _collection, _embedding_model
     _collection = None

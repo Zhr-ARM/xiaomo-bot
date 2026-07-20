@@ -19,7 +19,12 @@ ReplyCallback = Callable[[str, list[dict]], Awaitable[None]]
 
 
 class SilentWindow:
-    """静默窗口管理器"""
+    """静默窗口管理器
+
+    两阶段设计：
+    - WAITING: 计时器倒计时，新消息会重置计时器（合批）
+    - PROCESSING: 回调正在执行（LLM 调用中），新消息进入缓冲区，不打断
+    """
 
     def __init__(self):
         config = get_config().get("silent_window", {})
@@ -28,42 +33,87 @@ class SilentWindow:
         self._timers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, list[dict]] = defaultdict(list)
         self._callback: ReplyCallback | None = None
+        # 正在处理中的 key 集合 — 此时新消息不打断，只缓冲
+        self._processing: set[str] = set()
+        # 记录每个 key 是群聊还是私聊，处理完重启计时器时用
+        self._is_group: dict[str, bool] = {}
+        # 每个 key 的本轮等待时长；显式 @ 可以使用更短窗口，普通群聊仍用默认窗口。
+        self._wait_seconds: dict[str, float] = {}
 
     def set_callback(self, callback: ReplyCallback):
         """设置窗口到期时的回调"""
         self._callback = callback
 
-    def enqueue(self, key: str, message: dict, is_group: bool = False):
+    def enqueue(
+        self,
+        key: str,
+        message: dict,
+        is_group: bool = False,
+        wait_seconds: float | None = None,
+    ):
         """
         将消息加入等待队列并重置计时器。
         key: conversation key (如 private:123456 或 group:789012)
+
+        如果回调正在处理中（LLM 调用进行中），只缓冲消息，不打断。
         """
         self._pending[key].append(message)
+        self._is_group[key] = is_group
+        default_wait = self._group_seconds if is_group else self._private_seconds
+        self._wait_seconds[key] = default_wait if wait_seconds is None else max(0.0, float(wait_seconds))
 
-        # 取消旧计时器
+        # 回调正在处理中 → 不打断，消息已缓冲，后续会自动处理
+        if key in self._processing:
+            return
+
+        # 取消等待中的旧计时器（还没进入 processing 阶段）
         if key in self._timers and not self._timers[key].done():
             self._timers[key].cancel()
 
         # 启动新计时器
-        wait_seconds = self._group_seconds if is_group else self._private_seconds
-        self._timers[key] = asyncio.create_task(self._wait_then_fire(key, wait_seconds))
+        self._timers[key] = asyncio.create_task(
+            self._wait_then_fire(key, self._wait_seconds[key])
+        )
 
     async def _wait_then_fire(self, key: str, seconds: float):
         """等待窗口到期，然后触发回调"""
         try:
             await asyncio.sleep(seconds)
-            messages = self._pending.pop(key, [])
+
+            # 进入处理阶段 — 新消息不会再取消我们
             self._timers.pop(key, None)
+            self._processing.add(key)
+
+            messages = self._pending.pop(key, [])
 
             if messages and self._callback:
                 await self._callback(key, messages)
+
         except asyncio.CancelledError:
-            pass  # 被新消息重置，正常行为
+            pass  # 被新消息重置（仅在 WAITING 阶段），正常行为
         except Exception:
             logger.exception("SilentWindow callback failed for key %s", key)
+        finally:
+            self._processing.discard(key)
+
+            # 处理期间有新消息到达 → 重启计时器，不让它们被遗忘
+            if key in self._pending and self._pending[key]:
+                is_grp = self._is_group.get(key, False)
+                wait = self._wait_seconds.get(
+                    key,
+                    self._group_seconds if is_grp else self._private_seconds,
+                )
+                self._timers[key] = asyncio.create_task(
+                    self._wait_then_fire(key, wait)
+                )
+            else:
+                self._wait_seconds.pop(key, None)
 
     def flush(self, key: str):
         """立即触发某个 key 的待处理消息（不等待窗口）"""
+        # 如果在处理中，只返回 pending 不清除（等处理完会自动处理）
+        if key in self._processing:
+            return list(self._pending.get(key, []))
         timer = self._timers.pop(key, None)
         if timer and not timer.done():
             timer.cancel()
