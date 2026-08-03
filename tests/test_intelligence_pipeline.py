@@ -56,6 +56,35 @@ def test_batch_context_keeps_speakers_separate():
     assert "[CURRENT_MESSAGE][天照命 (QQ:u1)]: 天照命发的 sb" in prompt
 
 
+def test_ambient_context_block_is_available_for_proactive_join():
+    block = handlers._format_ambient_context_block(
+        "[天照命]: 有人来聊聊这个方案吗\n[其他人]: 感觉可以"
+    )
+
+    assert "[RECENT_GROUP_FLOW]" in block
+    assert "有人来聊聊这个方案吗" in block
+
+
+def test_join_reply_budget_respects_action_max_chars():
+    budget = handlers._reply_budget_for_message(
+        800,
+        180,
+        {"join_max_chars": 80},
+    )
+
+    assert budget == 80
+
+
+def test_join_reply_budget_ignores_invalid_action_budget():
+    budget = handlers._reply_budget_for_message(
+        800,
+        180,
+        {"join_max_chars": "bad"},
+    )
+
+    assert budget == 180
+
+
 def test_plain_text_at_only_triggers_for_bot(monkeypatch):
     class Segment:
         type = "text"

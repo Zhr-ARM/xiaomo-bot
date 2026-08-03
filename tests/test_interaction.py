@@ -193,3 +193,39 @@ def test_state_recorders_trim_five_minute_windows(monkeypatch):
 
     assert state.group_message_times["g1"] == [800.0, 1000.0]
     assert state.bot_reply_times["g1"] == [900.0, 1000.0]
+
+
+def test_recent_group_flow_formats_live_context(monkeypatch):
+    from src.plugins.xiaomo import state
+
+    state.group_recent_texts.clear()
+    monkeypatch.setattr(state.time, "time", lambda: 1000.0)
+
+    state.record_recent_group_text(
+        "g1", user_qq="u1", nickname="天照命", text="有人来聊聊这个方案吗"
+    )
+    state.record_recent_group_text(
+        "g1", user_qq="u2", nickname="", text="我觉得有点怪"
+    )
+
+    flow = state.format_recent_group_flow("g1", limit=2)
+
+    assert "[天照命]: 有人来聊聊这个方案吗" in flow
+    assert "[QQu2]: 我觉得有点怪" in flow
+
+
+def test_recent_group_flow_drops_expired_messages(monkeypatch):
+    from src.plugins.xiaomo import state
+
+    state.group_recent_texts.clear()
+    state.record_recent_group_text(
+        "g1", user_qq="u1", nickname="旧人", text="很早之前的话", now=80.0
+    )
+    state.record_recent_group_text(
+        "g1", user_qq="u2", nickname="新人", text="刚刚这句", now=260.0
+    )
+
+    flow = state.format_recent_group_flow("g1", now=280.0)
+
+    assert "很早之前" not in flow
+    assert "刚刚这句" in flow

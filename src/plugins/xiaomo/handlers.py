@@ -322,6 +322,11 @@ def _join_candidate_text(text: str, topic: str | None, action: str) -> str:
 def _format_join_instruction(decision_payload: dict) -> str:
     action = decision_payload.get("action", "short_reply")
     max_chars = int(decision_payload.get("max_chars") or 160)
+    action_hint = {
+        "react": "This should feel like a small in-the-moment reaction, not an answer.",
+        "short_reply": "Add one compact conversational turn.",
+        "helpful_reply": "Offer useful help, but keep it concise and situated.",
+    }.get(action, "Add one compact conversational turn.")
     return (
         "[PROACTIVE_JOIN]\n"
         "This message was not an explicit mention. Only join if it feels natural in the group flow.\n"
@@ -329,10 +334,35 @@ def _format_join_instruction(decision_payload: dict) -> str:
         f"score: {decision_payload.get('score', 0)}\n"
         f"reason: {decision_payload.get('reason', '')}\n"
         f"max_chars: {max_chars}\n"
+        f"{action_hint}\n"
         "Reply like a restrained group member: no lecture, no greeting, no self-introduction, no forced joke.\n"
         "If the group topic moved on or a human already answered, keep it very short or stay silent.\n"
         "[/PROACTIVE_JOIN]"
     )
+
+
+def _format_ambient_context_block(ambient_context: str) -> str:
+    text = (ambient_context or "").strip()
+    if not text:
+        return ""
+    return (
+        "[RECENT_GROUP_FLOW]\n"
+        "These are the latest group messages before this ambient join. "
+        "Use them as live context, but reply to the current opening only if it still fits.\n"
+        f"{text}\n"
+        "[/RECENT_GROUP_FLOW]"
+    )
+
+
+def _reply_budget_for_message(default_max: int, frame_max: int, current_msg: dict) -> int:
+    budget = min(default_max, frame_max or default_max)
+    try:
+        join_max = int(current_msg.get("join_max_chars") or 0)
+    except (TypeError, ValueError):
+        join_max = 0
+    if join_max > 0:
+        budget = min(budget, join_max)
+    return budget
 
 
 def _extract_text(event: MessageEvent) -> str:
@@ -605,12 +635,15 @@ async def _process_messages_inner(
 
     raw_text = (current_msg.get("text") or "").strip()
     batch_context = _format_batch_context(messages, display_names, current_msg)
+    ambient_context = (current_msg.get("ambient_context") or "").strip()
+    ambient_context_block = _format_ambient_context_block(ambient_context)
+    frame_context = batch_context or ambient_context
     planned_search_text = _select_search_text(messages, current_msg)
     planned_weather_query = _select_weather_query(messages, current_msg)
     frame = build_conversation_frame(
         current_msg=current_msg,
         raw_text=raw_text,
-        batch_context=batch_context,
+        batch_context=frame_context,
         explicit_trigger=explicit_trigger,
         search_query=planned_search_text,
         weather_query=planned_weather_query,
@@ -618,7 +651,13 @@ async def _process_messages_inner(
     frame_instruction = build_frame_instruction(frame)
     join_instruction = (current_msg.get("join_instruction") or "").strip()
     strategy_text = "\n".join(
-        part for part in [batch_context or raw_text, frame_instruction, join_instruction] if part
+        part
+        for part in [
+            batch_context or ambient_context_block or raw_text,
+            frame_instruction,
+            join_instruction,
+        ]
+        if part
     )
 
     # 构建用户消息
@@ -639,6 +678,8 @@ async def _process_messages_inner(
         mode=mode,
         batch_context=batch_context,
     )
+    if ambient_context_block and not batch_context:
+        combined_text = f"{combined_text}\n\n{ambient_context_block}"
     combined_text = f"{combined_text}\n\n{frame_instruction}"
     if join_instruction:
         combined_text = f"{combined_text}\n\n{join_instruction}"
@@ -740,7 +781,7 @@ async def _process_messages_inner(
             logger.exception("[Search] error for '%s'", search_text[:60])
 
     max_chars = get_config().get("output", {}).get("max_chars_per_message", 800)
-    reply_max_chars = min(max_chars, frame.max_chars or max_chars)
+    reply_max_chars = _reply_budget_for_message(max_chars, frame.max_chars, current_msg)
     tone_instruction = build_tone_instruction(
         scene=frame.scene,
         style=strategy.reply_style,
@@ -859,6 +900,13 @@ async def _on_message(event: MessageEvent):
 
         state.group_last_active[group_id_str] = _time.time()
         state.record_group_message(group_id_str, now=state.group_last_active[group_id_str])
+        state.record_recent_group_text(
+            group_id_str,
+            user_qq=user_qq,
+            nickname=nickname,
+            text=text,
+            now=state.group_last_active[group_id_str],
+        )
 
         # ── 自动戳戳 ──
 
@@ -1099,6 +1147,11 @@ async def _on_message(event: MessageEvent):
                         probability = _join_probability(join_decision.action, join_cfg)
                         if random.random() < probability:
                             decision_payload = join_decision.to_payload()
+                            recent_context = state.format_recent_group_flow(
+                                group_id_str,
+                                limit=int(join_cfg.get("recent_context_messages", 8)),
+                                now=now_ts,
+                            )
                             candidate = _join_candidate_text(
                                 text,
                                 detect_interesting_topic(text),
@@ -1109,6 +1162,7 @@ async def _on_message(event: MessageEvent):
                                 reason=_join_reason_for_action(join_decision.action),
                                 candidate_text=candidate,
                                 trigger_text=text,
+                                recent_context=recent_context,
                             ):
                                 message_id = await store_memory(
                                     user_qq=user_qq,
@@ -1135,6 +1189,8 @@ async def _on_message(event: MessageEvent):
                                         "join_instruction": _format_join_instruction(
                                             decision_payload
                                         ),
+                                        "join_max_chars": join_decision.max_chars,
+                                        "ambient_context": recent_context,
                                     },
                                     is_group=True,
                                     wait_seconds=float(join_cfg.get("window_seconds", 1.5)),

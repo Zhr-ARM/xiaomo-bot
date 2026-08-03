@@ -16,5 +16,6 @@ def test_default_proactive_join_is_chatty_but_rate_limited():
     assert cfg["enabled"] is True
     assert cfg["min_cooldown_seconds"] <= 180
     assert cfg["window_seconds"] <= 1.0
+    assert cfg["recent_context_messages"] >= 6
     assert cfg["probability"]["short_reply"] >= 0.65
     assert cfg["probability"]["helpful_reply"] >= 0.85

@@ -239,6 +239,7 @@ proactive_join:
   enabled: true
   min_cooldown_seconds: 150
   window_seconds: 0.9
+  recent_context_messages: 8
   probability:
     react: 0.38
     short_reply: 0.68

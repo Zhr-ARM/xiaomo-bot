@@ -20,6 +20,9 @@ bot_reply_times: dict[str, list[float]] = {}
 # 群消息缓存：用于复读检测
 group_recent_messages: dict[str, list[str]] = {}
 
+# 群短期文本流：用于主动接话时理解刚刚发生的聊天，不进入长期记忆
+group_recent_texts: dict[str, list[dict]] = {}
+
 # 复读计数器: group_id -> {text: count}
 repeat_counter: dict[str, dict[str, int]] = {}
 
@@ -63,6 +66,8 @@ IMAGE_CACHE_TTL = 300
 
 
 RECENT_WINDOW_SECONDS = 300.0
+RECENT_TEXT_WINDOW_SECONDS = 180.0
+RECENT_TEXT_LIMIT = 16
 
 
 def trim_recent_times(
@@ -93,6 +98,66 @@ def record_bot_reply(group_id: str, *, now: float | None = None) -> None:
     times = trim_recent_times(bot_reply_times, group_id, now=now)
     times.append(now)
     bot_reply_times[group_id] = times
+
+
+def record_recent_group_text(
+    group_id: str,
+    *,
+    user_qq: str | None,
+    nickname: str | None,
+    text: str,
+    now: float | None = None,
+) -> None:
+    """Record a short-lived group text snippet for ambient participation."""
+    clean = (text or "").strip()
+    if not clean:
+        return
+    if now is None:
+        now = time.time()
+
+    recent = [
+        item
+        for item in group_recent_texts.get(group_id, [])
+        if now - float(item.get("time", 0)) <= RECENT_TEXT_WINDOW_SECONDS
+    ]
+    recent.append(
+        {
+            "time": now,
+            "user_qq": str(user_qq or ""),
+            "nickname": (nickname or "").strip(),
+            "text": clean[:240],
+        }
+    )
+    group_recent_texts[group_id] = recent[-RECENT_TEXT_LIMIT:]
+
+
+def format_recent_group_flow(
+    group_id: str,
+    *,
+    limit: int = 8,
+    now: float | None = None,
+) -> str:
+    """Format recent in-memory group flow for prompt context."""
+    if now is None:
+        now = time.time()
+    recent = [
+        item
+        for item in group_recent_texts.get(group_id, [])
+        if now - float(item.get("time", 0)) <= RECENT_TEXT_WINDOW_SECONDS
+    ]
+    group_recent_texts[group_id] = recent[-RECENT_TEXT_LIMIT:]
+    if not recent:
+        return ""
+
+    lines = []
+    for item in recent[-max(1, int(limit)):]:
+        name = item.get("nickname") or (
+            f"QQ{item.get('user_qq')}" if item.get("user_qq") else "成员"
+        )
+        text = str(item.get("text") or "").strip()
+        if text:
+            lines.append(f"[{name}]: {text[:160]}")
+    return "\n".join(lines)
 
 
 def get_llm_lock(group_id: str) -> asyncio.Lock:
