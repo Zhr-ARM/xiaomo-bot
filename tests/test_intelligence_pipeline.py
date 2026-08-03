@@ -85,6 +85,100 @@ def test_join_reply_budget_ignores_invalid_action_budget():
     assert budget == 180
 
 
+def test_local_light_reaction_handles_small_banter():
+    reply = handlers._choose_local_light_reaction(
+        "哈哈哈哈这也太离谱了",
+        chooser=lambda replies: replies[0],
+    )
+
+    assert reply == "笑死"
+
+
+def test_typing_delay_caps_proactive_react():
+    delay = handlers._typing_delay_seconds(
+        "这是一句轻反应",
+        explicit_trigger=False,
+        proactive=True,
+        action="react",
+        cfg={
+            "enabled": True,
+            "chars_per_second": 1,
+            "jitter_seconds": 10,
+            "min_seconds": 0.1,
+            "max_seconds": 10,
+            "proactive_max_seconds": 1.2,
+        },
+        jitter=10,
+    )
+
+    assert delay <= 0.8
+
+
+def test_post_send_context_check_cancels_stale_proactive(monkeypatch):
+    from src.plugins.xiaomo import state
+
+    state.group_recent_texts.clear()
+    state.bot_reply_times.clear()
+    monkeypatch.setattr(
+        handlers,
+        "get_config",
+        lambda: {
+            "proactive_join": {
+                "post_check": {
+                    "enabled": True,
+                    "stale_seconds": 10,
+                    "cancel_after_human_messages": 3,
+                    "cancel_if_bot_spoke": True,
+                }
+            }
+        },
+    )
+
+    ok, reason = handlers._post_send_context_check(
+        "g1",
+        {"timestamp": 100.0, "join_instruction": "yes"},
+        explicit_trigger=False,
+        now=120.0,
+    )
+
+    assert ok is False
+    assert reason == "stale"
+
+
+def test_post_send_context_check_cancels_when_humans_continue(monkeypatch):
+    from src.plugins.xiaomo import state
+
+    state.group_recent_texts.clear()
+    state.bot_reply_times.clear()
+    state.bot_qq_id = "bot"
+    monkeypatch.setattr(
+        handlers,
+        "get_config",
+        lambda: {
+            "proactive_join": {
+                "post_check": {
+                    "enabled": True,
+                    "stale_seconds": 60,
+                    "cancel_after_human_messages": 2,
+                    "cancel_if_bot_spoke": True,
+                }
+            }
+        },
+    )
+    state.record_recent_group_text("g1", user_qq="u1", nickname="A", text="新话题1", now=110.0)
+    state.record_recent_group_text("g1", user_qq="u2", nickname="B", text="新话题2", now=111.0)
+
+    ok, reason = handlers._post_send_context_check(
+        "g1",
+        {"timestamp": 100.0, "join_instruction": "yes"},
+        explicit_trigger=False,
+        now=112.0,
+    )
+
+    assert ok is False
+    assert reason == "humans continued"
+
+
 def test_plain_text_at_only_triggers_for_bot(monkeypatch):
     class Segment:
         type = "text"

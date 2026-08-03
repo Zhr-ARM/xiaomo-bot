@@ -63,6 +63,44 @@ from .web_search import run_smart_search_result
 
 logger = logging.getLogger("xiaomo.handlers")
 
+PROFILE_TOPIC_KEYWORDS = (
+    ("python", "Python"),
+    ("linux", "Linux"),
+    ("github", "GitHub"),
+    ("git", "Git"),
+    ("单片机", "单片机"),
+    ("嵌入式", "嵌入式"),
+    ("stm32", "STM32"),
+    ("esp32", "ESP32"),
+    ("ai", "AI"),
+    ("人工智能", "AI"),
+    ("模型", "模型"),
+    ("代码", "编程"),
+    ("编程", "编程"),
+    ("bug", "调试"),
+    ("报错", "调试"),
+    ("游戏", "游戏"),
+    ("动漫", "动漫"),
+    ("考试", "考试"),
+)
+
+PROFILE_STYLE_CUES = (
+    (("哈哈", "笑死", "绷不住"), "爱开玩笑"),
+    (("草", "离谱", "抽象"), "喜欢吐槽"),
+    (("救命", "不会了", "卡住"), "遇到问题会直接求助"),
+    (("谢谢", "感谢", "thx"), "会礼貌反馈"),
+    (("熬夜", "睡不着", "通宵"), "经常聊熬夜状态"),
+)
+
+LOCAL_LIGHT_REACTION_RULES = (
+    (("哈哈", "笑死", "绷不住"), ("笑死", "这句有点绷不住")),
+    (("寄了", "寄寄"), ("这下真有点寄", "先别急着寄")),
+    (("有人吗", "有人在吗", "有人来", "聊聊"), ("在，刚探头", "在呢，怎么个事")),
+    (("离谱", "抽象"), ("确实有点离谱", "这个有点抽象")),
+    (("草",), ("草，懂了", "草")),
+    (("累", "困", "顶不住"), ("先缓口气", "感觉该歇一下了")),
+)
+
 # 天气查询关键词（显式 + 隐晦）
 _WEATHER_PATTERNS = [
     "天气", "天气预报",
@@ -288,6 +326,41 @@ def _select_batch_field(messages: list[dict], current_msg: dict, field: str) -> 
     return ""
 
 
+def _append_unique_limited(items: list[str], value: str, limit: int) -> list[str]:
+    if not value:
+        return items[-limit:]
+    cleaned = [str(item) for item in items if item]
+    if value in cleaned:
+        return cleaned[-limit:]
+    cleaned.append(value)
+    return cleaned[-limit:]
+
+
+def _learn_profile_traits(profile_data: dict | None, text: str) -> dict:
+    data = dict(profile_data or {})
+    clean = (text or "").strip()
+    if not clean:
+        return data
+
+    lowered = clean.lower()
+    topics = list(data.get("topics") or [])
+    style_notes = list(data.get("style_notes") or [])
+
+    for cue, label in PROFILE_TOPIC_KEYWORDS:
+        if cue.lower() in lowered:
+            topics = _append_unique_limited(topics, label, 10)
+
+    for cues, note in PROFILE_STYLE_CUES:
+        if any(cue.lower() in lowered for cue in cues):
+            style_notes = _append_unique_limited(style_notes, note, 8)
+
+    if topics:
+        data["topics"] = topics
+    if style_notes:
+        data["style_notes"] = style_notes
+    return data
+
+
 # ─── 消息预处理 ────────────────────────────────────────────────────────────────
 
 
@@ -299,14 +372,17 @@ def _join_reason_for_action(action: str) -> str:
     }.get(action, "join_short")
 
 
-def _join_probability(action: str, cfg: dict) -> float:
+def _join_probability(action: str, cfg: dict, group_id: str | None = None) -> float:
     probability_cfg = cfg.get("probability", {}) if isinstance(cfg, dict) else {}
     defaults = {
         "react": 0.30,
         "short_reply": 0.58,
         "helpful_reply": 0.82,
     }
-    return float(probability_cfg.get(action, defaults.get(action, 0.0)))
+    probability = float(probability_cfg.get(action, defaults.get(action, 0.0)))
+    if group_id:
+        probability *= state.proactive_join_probability_multiplier(group_id)
+    return max(0.0, min(0.98, probability))
 
 
 def _join_candidate_text(text: str, topic: str | None, action: str) -> str:
@@ -363,6 +439,134 @@ def _reply_budget_for_message(default_max: int, frame_max: int, current_msg: dic
     if join_max > 0:
         budget = min(budget, join_max)
     return budget
+
+
+def _choose_local_light_reaction(text: str, chooser=random.choice) -> str | None:
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return None
+    for cues, replies in LOCAL_LIGHT_REACTION_RULES:
+        if any(cue.lower() in lowered for cue in cues):
+            return str(chooser(replies))
+    return None
+
+
+def _typing_delay_seconds(
+    reply: str,
+    *,
+    explicit_trigger: bool,
+    proactive: bool,
+    action: str = "",
+    cfg: dict | None = None,
+    jitter: float | None = None,
+) -> float:
+    timing_cfg = cfg if cfg is not None else get_config().get("human_timing", {})
+    if timing_cfg.get("enabled", True) is False:
+        return 0.0
+    text = (reply or "").strip()
+    if not text:
+        return 0.0
+
+    cps = max(1.0, float(timing_cfg.get("chars_per_second", 22)))
+    min_seconds = max(0.0, float(timing_cfg.get("min_seconds", 0.15)))
+    max_seconds = max(min_seconds, float(timing_cfg.get("max_seconds", 3.0)))
+    jitter_max = max(0.0, float(timing_cfg.get("jitter_seconds", 0.45)))
+    jitter_value = random.uniform(0.0, jitter_max) if jitter is None else max(0.0, jitter)
+
+    delay = len(text) / cps + jitter_value
+    delay = max(min_seconds, min(delay, max_seconds))
+    if explicit_trigger:
+        delay = min(delay, float(timing_cfg.get("explicit_max_seconds", 0.8)))
+    if proactive:
+        delay = min(delay, float(timing_cfg.get("proactive_max_seconds", 1.2)))
+    if action == "react":
+        delay = min(delay, 0.8)
+    return round(max(0.0, delay), 3)
+
+
+def _post_send_context_check(
+    group_id: str,
+    current_msg: dict,
+    *,
+    explicit_trigger: bool,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    if explicit_trigger or not current_msg.get("join_instruction"):
+        return True, "explicit-or-normal"
+
+    cfg = get_config().get("proactive_join", {}).get("post_check", {})
+    if cfg.get("enabled", True) is False:
+        return True, "disabled"
+
+    if now is None:
+        now = _time.time()
+    try:
+        started_at = float(current_msg.get("timestamp") or now)
+    except (TypeError, ValueError):
+        started_at = now
+
+    stale_seconds = float(cfg.get("stale_seconds", 30))
+    if now - started_at > stale_seconds:
+        return False, "stale"
+
+    if cfg.get("cancel_if_bot_spoke", True):
+        bot_after = [
+            t for t in state.bot_reply_times.get(group_id, [])
+            if float(t) > started_at
+        ]
+        if bot_after:
+            return False, "bot already spoke"
+
+    new_human_texts = []
+    for item in state.group_recent_texts.get(group_id, []):
+        try:
+            msg_time = float(item.get("time", 0))
+        except (TypeError, ValueError):
+            msg_time = 0.0
+        if msg_time <= started_at:
+            continue
+        if str(item.get("user_qq") or "") == str(state.bot_qq_id or ""):
+            continue
+        new_human_texts.append(str(item.get("text") or ""))
+
+    bot_names = _bot_name_candidates(state.bot_qq_id)
+    if any(any(name and name in text for name in bot_names) for text in new_human_texts):
+        return False, "new direct mention"
+
+    cancel_after = int(cfg.get("cancel_after_human_messages", 3))
+    if len(new_human_texts) >= cancel_after:
+        return False, "humans continued"
+
+    return True, "still relevant"
+
+
+async def _wait_for_natural_send_timing(
+    reply: str,
+    *,
+    group_id: str,
+    current_msg: dict,
+    explicit_trigger: bool,
+    proactive: bool,
+) -> bool:
+    delay = _typing_delay_seconds(
+        reply,
+        explicit_trigger=explicit_trigger,
+        proactive=proactive,
+        action=str(current_msg.get("join_action") or ""),
+    )
+    if delay > 0:
+        await asyncio.sleep(delay)
+    ok, reason = _post_send_context_check(
+        group_id,
+        current_msg,
+        explicit_trigger=explicit_trigger,
+    )
+    if not ok:
+        logger.info(
+            "Proactive reply cancelled before send: group=%s reason=%s",
+            group_id, reason,
+        )
+    return ok
 
 
 def _extract_text(event: MessageEvent) -> str:
@@ -528,11 +732,19 @@ def _extract_at_text(event: GroupMessageEvent, bot_qq: str) -> str:
     return text.strip()
 
 
-async def _update_user_profile(qq_id: str, nickname: str | None = None):
+async def _update_user_profile(
+    qq_id: str,
+    nickname: str | None = None,
+    *,
+    text: str = "",
+):
     async with await get_session() as session:
         user = await get_or_create_user(session, qq_id)
         if nickname and user.nickname != nickname:
             user.nickname = nickname
+        learned = _learn_profile_traits(user.get_profile(), text)
+        if learned != user.get_profile():
+            user.set_profile(learned)
         await session.commit()
 
 
@@ -857,9 +1069,20 @@ async def _process_messages_inner(
             pass
         return
 
+    if not await _wait_for_natural_send_timing(
+        reply,
+        group_id=group_id,
+        current_msg=current_msg,
+        explicit_trigger=explicit_trigger,
+        proactive=bool(join_instruction),
+    ):
+        return
+
     print(f"[REPLY] Attempting to send: len={len(reply)}")
     try:
         await _send_group_reply(bot, group_id, reply)
+        if join_instruction:
+            state.mark_proactive_join_sent(group_id)
         print(f"[REPLY] Sent successfully")
     except Exception as e:
         print(f"[REPLY] Failed to send: {e}")
@@ -885,10 +1108,9 @@ async def _on_message(event: MessageEvent):
     sender = event.sender
     nickname = sender.nickname if sender else None
 
-    await _update_user_profile(user_qq, nickname)
-
     # 私聊：直接拒绝
     if isinstance(event, PrivateMessageEvent):
+        await _update_user_profile(user_qq, nickname)
         return
 
     # 群聊处理
@@ -897,6 +1119,8 @@ async def _on_message(event: MessageEvent):
 
         if not _is_allowed_group(group_id_str):
             return
+
+        await _update_user_profile(user_qq, nickname, text=text)
 
         state.group_last_active[group_id_str] = _time.time()
         state.record_group_message(group_id_str, now=state.group_last_active[group_id_str])
@@ -907,6 +1131,19 @@ async def _on_message(event: MessageEvent):
             text=text,
             now=state.group_last_active[group_id_str],
         )
+        feedback_outcome = state.observe_proactive_join_feedback(
+            group_id_str,
+            user_qq=user_qq,
+            bot_qq=state.bot_qq_id,
+            now=state.group_last_active[group_id_str],
+        )
+        if feedback_outcome:
+            logger.info(
+                "Proactive join feedback: group=%s outcome=%s multiplier=%.2f",
+                group_id_str,
+                feedback_outcome,
+                state.proactive_join_probability_multiplier(group_id_str),
+            )
 
         # ── 自动戳戳 ──
 
@@ -1110,6 +1347,8 @@ async def _on_message(event: MessageEvent):
                     asyncio.create_task(
                         try_poke_topic(group_id_str, user_qq, topic)
                     )
+        sent_proactive_join = False
+
         # 关键词反应 / 弔图语录
         if not should_respond and text:
             join_cfg = get_config().get("proactive_join", {})
@@ -1144,7 +1383,9 @@ async def _on_message(event: MessageEvent):
                         )
                     )
                     if join_decision.action != "silent":
-                        probability = _join_probability(join_decision.action, join_cfg)
+                        probability = _join_probability(
+                            join_decision.action, join_cfg, group_id_str,
+                        )
                         if random.random() < probability:
                             decision_payload = join_decision.to_payload()
                             recent_context = state.format_recent_group_flow(
@@ -1157,6 +1398,14 @@ async def _on_message(event: MessageEvent):
                                 detect_interesting_topic(text),
                                 join_decision.action,
                             )
+                            local_reply = None
+                            if (
+                                join_decision.action == "react"
+                                and join_cfg.get("local_reactions_enabled", True)
+                            ):
+                                local_reply = _choose_local_light_reaction(text)
+                                if local_reply:
+                                    candidate = local_reply
                             if await should_send_proactive_message(
                                 group_id=group_id_str,
                                 reason=_join_reason_for_action(join_decision.action),
@@ -1164,47 +1413,83 @@ async def _on_message(event: MessageEvent):
                                 trigger_text=text,
                                 recent_context=recent_context,
                             ):
-                                message_id = await store_memory(
-                                    user_qq=user_qq,
-                                    group_id=group_id_str,
-                                    scene="group",
-                                    role="user",
-                                    content=text,
-                                )
-                                get_silent_window().enqueue(
-                                    group_key(group_id_str),
-                                    {
-                                        "scene": "group",
-                                        "target_id": user_qq,
-                                        "group_id": group_id_str,
-                                        "user_qq": user_qq,
-                                        "text": text,
+                                if local_reply:
+                                    current_local_msg = {
                                         "timestamp": now_ts,
-                                        "mode": "normal",
-                                        "mode_target": "",
-                                        "explicit_trigger": False,
-                                        "search_text": "",
-                                        "weather_query": "",
-                                        "message_id": message_id,
                                         "join_instruction": _format_join_instruction(
                                             decision_payload
                                         ),
-                                        "join_max_chars": join_decision.max_chars,
-                                        "ambient_context": recent_context,
-                                    },
-                                    is_group=True,
-                                    wait_seconds=float(join_cfg.get("window_seconds", 1.5)),
-                                )
-                                state.proactive_join_last_time[group_id_str] = now_ts
-                                logger.info(
-                                    "Proactive join queued: group=%s action=%s score=%s reason=%s",
-                                    group_id_str,
-                                    join_decision.action,
-                                    join_decision.score,
-                                    join_decision.reason,
-                                )
+                                        "join_action": join_decision.action,
+                                    }
+                                    if await _wait_for_natural_send_timing(
+                                        local_reply,
+                                        group_id=group_id_str,
+                                        current_msg=current_local_msg,
+                                        explicit_trigger=False,
+                                        proactive=True,
+                                    ):
+                                        await store_memory(
+                                            user_qq=user_qq,
+                                            group_id=group_id_str,
+                                            scene="group",
+                                            role="user",
+                                            content=text,
+                                        )
+                                        await _send_group_reply(
+                                            bot, group_id_str, local_reply,
+                                        )
+                                        state.mark_proactive_join_sent(group_id_str)
+                                        state.proactive_join_last_time[group_id_str] = now_ts
+                                        sent_proactive_join = True
+                                        logger.info(
+                                            "Local proactive reaction sent: group=%s action=%s score=%s",
+                                            group_id_str,
+                                            join_decision.action,
+                                            join_decision.score,
+                                        )
+                                else:
+                                    message_id = await store_memory(
+                                        user_qq=user_qq,
+                                        group_id=group_id_str,
+                                        scene="group",
+                                        role="user",
+                                        content=text,
+                                    )
+                                    get_silent_window().enqueue(
+                                        group_key(group_id_str),
+                                        {
+                                            "scene": "group",
+                                            "target_id": user_qq,
+                                            "group_id": group_id_str,
+                                            "user_qq": user_qq,
+                                            "text": text,
+                                            "timestamp": now_ts,
+                                            "mode": "normal",
+                                            "mode_target": "",
+                                            "explicit_trigger": False,
+                                            "search_text": "",
+                                            "weather_query": "",
+                                            "message_id": message_id,
+                                            "join_instruction": _format_join_instruction(
+                                                decision_payload
+                                            ),
+                                            "join_max_chars": join_decision.max_chars,
+                                            "join_action": join_decision.action,
+                                            "ambient_context": recent_context,
+                                        },
+                                        is_group=True,
+                                        wait_seconds=float(join_cfg.get("window_seconds", 1.5)),
+                                    )
+                                    state.proactive_join_last_time[group_id_str] = now_ts
+                                    logger.info(
+                                        "Proactive join queued: group=%s action=%s score=%s reason=%s",
+                                        group_id_str,
+                                        join_decision.action,
+                                        join_decision.score,
+                                        join_decision.reason,
+                                    )
 
-        if not should_respond and text:
+        if not should_respond and text and not sent_proactive_join:
             reaction = check_reaction(text, group_id_str)
             if reaction:
                 if await should_send_proactive_message(

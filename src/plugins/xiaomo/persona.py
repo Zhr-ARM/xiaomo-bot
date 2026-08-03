@@ -77,6 +77,8 @@ def build_system_prompt(
         profile_data = user_profile.get("profile", {})
         if profile_data.get("topics"):
             p.append(f"- 感兴趣的方向：{', '.join(profile_data['topics'])}")
+        if profile_data.get("style_notes"):
+            p.append(f"- 互动习惯：{', '.join(profile_data['style_notes'])}")
         parts.extend(p)
 
     # 情绪惯性：保持跨轮次角色连贯

@@ -240,10 +240,26 @@ proactive_join:
   min_cooldown_seconds: 150
   window_seconds: 0.9
   recent_context_messages: 8
+  local_reactions_enabled: true
+  post_check:
+    enabled: true
+    stale_seconds: 30
+    cancel_after_human_messages: 3
+    cancel_if_bot_spoke: true
   probability:
     react: 0.38
     short_reply: 0.68
     helpful_reply: 0.88
+
+# 发送节奏（模拟真人打字，显式 @ 会保持快）
+human_timing:
+  enabled: true
+  chars_per_second: 22
+  jitter_seconds: 0.45
+  min_seconds: 0.15
+  max_seconds: 3.0
+  explicit_max_seconds: 0.8
+  proactive_max_seconds: 1.2
 
 # 自动行为
 auto_action:

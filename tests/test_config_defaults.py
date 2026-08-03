@@ -17,5 +17,16 @@ def test_default_proactive_join_is_chatty_but_rate_limited():
     assert cfg["min_cooldown_seconds"] <= 180
     assert cfg["window_seconds"] <= 1.0
     assert cfg["recent_context_messages"] >= 6
+    assert cfg["local_reactions_enabled"] is True
+    assert cfg["post_check"]["enabled"] is True
+    assert cfg["post_check"]["cancel_after_human_messages"] <= 3
     assert cfg["probability"]["short_reply"] >= 0.65
     assert cfg["probability"]["helpful_reply"] >= 0.85
+
+
+def test_default_human_timing_keeps_mentions_fast():
+    cfg = load_config()["human_timing"]
+
+    assert cfg["enabled"] is True
+    assert cfg["explicit_max_seconds"] <= 1.0
+    assert cfg["proactive_max_seconds"] <= 1.5

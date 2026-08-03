@@ -229,3 +229,31 @@ def test_recent_group_flow_drops_expired_messages(monkeypatch):
 
     assert "很早之前" not in flow
     assert "刚刚这句" in flow
+
+
+def test_proactive_feedback_increases_probability_after_human_reply():
+    from src.plugins.xiaomo import state
+
+    state.proactive_join_feedback.clear()
+    state.mark_proactive_join_sent("g1", now=100.0)
+
+    outcome = state.observe_proactive_join_feedback(
+        "g1", user_qq="u1", bot_qq="bot", now=120.0,
+    )
+
+    assert outcome == "continued"
+    assert state.proactive_join_probability_multiplier("g1") > 1.0
+
+
+def test_proactive_feedback_decreases_probability_after_stall():
+    from src.plugins.xiaomo import state
+
+    state.proactive_join_feedback.clear()
+    state.mark_proactive_join_sent("g1", now=100.0)
+
+    outcome = state.observe_proactive_join_feedback(
+        "g1", user_qq="u1", bot_qq="bot", now=400.0,
+    )
+
+    assert outcome == "stalled"
+    assert state.proactive_join_probability_multiplier("g1") < 1.0

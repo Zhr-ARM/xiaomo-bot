@@ -53,6 +53,9 @@ auto_poke_last_time: dict[str, float] = {}
 
 proactive_join_last_time: dict[str, float] = {}
 
+# 主动接话反馈：根据“发完后是否有人接着聊”轻微调节后续主动概率
+proactive_join_feedback: dict[str, dict] = {}
+
 # LLM 并发锁：群级，同一时间只处理一个 LLM 请求
 _llm_locks: dict[str, asyncio.Lock] = {}
 
@@ -158,6 +161,58 @@ def format_recent_group_flow(
         if text:
             lines.append(f"[{name}]: {text[:160]}")
     return "\n".join(lines)
+
+
+def mark_proactive_join_sent(group_id: str, *, now: float | None = None) -> None:
+    """Start a feedback window after an ambient proactive reply is sent."""
+    if now is None:
+        now = time.time()
+    data = proactive_join_feedback.setdefault(group_id, {"score": 0.0})
+    data["pending"] = {
+        "sent_at": now,
+        "expires_at": now + 180.0,
+    }
+
+
+def observe_proactive_join_feedback(
+    group_id: str,
+    *,
+    user_qq: str | None = None,
+    bot_qq: str | None = None,
+    now: float | None = None,
+) -> str | None:
+    """Update feedback score when the next human message arrives."""
+    if user_qq and bot_qq and str(user_qq) == str(bot_qq):
+        return None
+    if now is None:
+        now = time.time()
+
+    data = proactive_join_feedback.get(group_id)
+    if not data:
+        return None
+    pending = data.get("pending")
+    if not pending:
+        return None
+
+    score = float(data.get("score", 0.0))
+    if now <= float(pending.get("expires_at", 0)):
+        score = min(0.35, score + 0.08)
+        outcome = "continued"
+    else:
+        score = max(-0.35, score - 0.05)
+        outcome = "stalled"
+
+    data["score"] = score
+    data["last_outcome"] = outcome
+    data["last_updated"] = now
+    data.pop("pending", None)
+    return outcome
+
+
+def proactive_join_probability_multiplier(group_id: str) -> float:
+    """Return a small adaptive multiplier based on recent proactive outcomes."""
+    score = float(proactive_join_feedback.get(group_id, {}).get("score", 0.0))
+    return max(0.65, min(1.35, 1.0 + score))
 
 
 def get_llm_lock(group_id: str) -> asyncio.Lock:
