@@ -2,7 +2,7 @@
 # 敏感信息请通过 .env 环境变量设置
 
 # 允许回复的群号列表 (空列表 = 允许所有群)
-allowed_group_ids: ["1056259135"]
+allowed_group_ids: ["1056259135", "1070638552"]
 
 # 数据库文件路径
 database_path: "${DATABASE_PATH:-data/xiaomo.db}"
@@ -55,12 +55,12 @@ proactive:
 # 主动插话机会评分（非 @ 时只在合适空位短接一句）
 proactive_join:
   enabled: true
-  min_cooldown_seconds: 360
-  window_seconds: 1.2
+  min_cooldown_seconds: 150
+  window_seconds: 0.9
   probability:
-    react: 0.22
-    short_reply: 0.50
-    helpful_reply: 0.76
+    react: 0.38
+    short_reply: 0.68
+    helpful_reply: 0.88
 
 # 类人化回复策略（显式 @ 或叫小源后的正式回复前置判断）
 humanize:

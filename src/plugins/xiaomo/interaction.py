@@ -56,6 +56,12 @@ OPINION_CUES = (
     "\u8bf4\u5b9e\u8bdd", "\u600e\u4e48\u770b", "\u9510\u8bc4", "\u8bc4\u4ef7",
 )
 
+SOCIAL_CUES = (
+    "\u6709\u4eba", "\u8c01\u6765", "\u6765\u4e0d\u6765", "\u804a\u804a",
+    "\u6c34\u7fa4", "\u5192\u4e2a\u6ce1", "\u5728\u5e72\u561b", "\u5e72\u5565",
+    "\u60f3\u95ee", "\u6c42\u63a8\u8350", "\u6709\u65e0", "\u6709\u6ca1",
+)
+
 
 @dataclass
 class JoinOpportunitySignals:
@@ -105,6 +111,11 @@ def _has_opinion_opening(text: str) -> bool:
     return any(cue.lower() in lowered for cue in OPINION_CUES)
 
 
+def _has_social_opening(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(cue.lower() in lowered for cue in SOCIAL_CUES)
+
+
 def _action_for_score(score: int) -> str:
     if score < 40:
         return "silent"
@@ -116,11 +127,11 @@ def _action_for_score(score: int) -> str:
 
 
 def _join_action_for_score(score: int) -> tuple[str, int]:
-    if score < 36:
+    if score < 32:
         return "silent", 0
-    if score < 50:
+    if score < 46:
         return "react", 80
-    if score < 68:
+    if score < 64:
         return "short_reply", 160
     return "helpful_reply", 360
 
@@ -196,25 +207,36 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         return JoinOpportunityDecision(0, "silent", "empty", 0)
     if signals.quiet_hours:
         return JoinOpportunityDecision(0, "silent", "quiet hours", 0)
+    if signals.bot_messages_last_5m >= 2 and signals.seconds_since_bot_reply < 90:
+        return JoinOpportunityDecision(0, "silent", "bot spoke too much", 0)
+    if (
+        signals.messages_last_5m >= 18
+        and signals.seconds_since_bot_reply < 120
+        and signals.human_messages_since_bot < 3
+    ):
+        return JoinOpportunityDecision(0, "silent", "busy group and recent bot reply", 0)
 
     reasons: list[str] = []
-    score = 30
+    score = 34
 
     if _has_help_intent(text):
         score += 34
         reasons.append("help intent")
     if _has_question_intent(text):
-        score += 18
+        score += 20
         reasons.append("question")
     if signals.topic_match:
-        score += 14
+        score += 16
         reasons.append("topic match")
     if _has_emotional_opening(text):
-        score += 10
+        score += 12
         reasons.append("emotion")
     if _has_opinion_opening(text):
-        score += 8
+        score += 10
         reasons.append("opinion opening")
+    if _has_social_opening(text):
+        score += 12
+        reasons.append("social opening")
 
     text_len = len(text)
     if text_len < 3:
@@ -237,7 +259,7 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         score -= 14
         reasons.append("busy group")
     elif signals.messages_last_5m <= 3:
-        score += 8
+        score += 10
         reasons.append("room to speak")
 
     if signals.bot_messages_last_5m >= 2:
@@ -251,12 +273,12 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         score -= 36
         reasons.append("recent bot reply")
     elif signals.seconds_since_bot_reply < 300:
-        score -= 16
+        score -= 14
     elif signals.seconds_since_bot_reply < 600:
-        score -= 6
+        score -= 4
 
     if signals.human_messages_since_bot < 3 and signals.seconds_since_bot_reply < 900:
-        score -= 12
+        score -= 10
         reasons.append("not enough human turns")
 
     score = max(0, min(100, int(score)))

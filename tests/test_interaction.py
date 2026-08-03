@@ -124,6 +124,34 @@ def test_join_opportunity_opinion_opening_gets_at_least_react():
     assert decision.score >= 36
 
 
+def test_join_opportunity_social_opening_invites_short_reply():
+    decision = interaction.decide_join_opportunity(
+        interaction.JoinOpportunitySignals(
+            trigger_text="\u6709\u4eba\u6765\u804a\u804a\u8fd9\u4e2a\u65b9\u6848\u5417",
+            messages_last_5m=2,
+            seconds_since_bot_reply=1200,
+            human_messages_since_bot=6,
+        )
+    )
+
+    assert decision.action in {"short_reply", "helpful_reply"}
+    assert decision.score >= 64
+
+
+def test_join_opportunity_light_emotion_can_react_when_roomy():
+    decision = interaction.decide_join_opportunity(
+        interaction.JoinOpportunitySignals(
+            trigger_text="\u54c8\u54c8",
+            messages_last_5m=1,
+            seconds_since_bot_reply=1200,
+            human_messages_since_bot=6,
+        )
+    )
+
+    assert decision.action in {"react", "short_reply"}
+    assert decision.score >= 32
+
+
 def test_join_opportunity_respects_quiet_hours():
     decision = interaction.decide_join_opportunity(
         interaction.JoinOpportunitySignals(

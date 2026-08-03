@@ -302,9 +302,9 @@ def _join_reason_for_action(action: str) -> str:
 def _join_probability(action: str, cfg: dict) -> float:
     probability_cfg = cfg.get("probability", {}) if isinstance(cfg, dict) else {}
     defaults = {
-        "react": 0.12,
-        "short_reply": 0.32,
-        "helpful_reply": 0.58,
+        "react": 0.30,
+        "short_reply": 0.58,
+        "helpful_reply": 0.82,
     }
     return float(probability_cfg.get(action, defaults.get(action, 0.0)))
 
