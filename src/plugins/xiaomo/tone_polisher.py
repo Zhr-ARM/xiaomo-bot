@@ -225,6 +225,7 @@ def _decatify(text: str) -> str:
     cleaned = cleaned.replace("本猫", "我").replace("猫猫", "我").replace("🐾", "")
     cleaned = re.sub(r"喵(?=[～~，,。.!！?？\s]|$)", "", cleaned)
     cleaned = re.sub(r"[（(]\s*(?:ΦωΦ|=\^･?ω･?\^=)\s*[）)]", "", cleaned)
+    cleaned = re.sub(r"(?<=[\u4e00-\u9fff])[～~]+(?=[\u4e00-\u9fff])", "，", cleaned)
     cleaned = re.sub(r"[～~]+", "", cleaned)
     return cleaned
 

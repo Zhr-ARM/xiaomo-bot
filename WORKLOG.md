@@ -25,7 +25,7 @@
 - 过滤守护进程健康探测访问日志；消息与摘要查询增加 ID 次级排序，压缩边界使用批次最小/最大 ID。
 
 验证：
-- `python -m pytest -q`：`120 passed`。
+- `python -m pytest -q`：`121 passed`。
 - `python -m ruff check src tests test_integration.py --ignore E402`：通过。
 - `python -m compileall -q src bot.py test_integration.py`：通过。
 - `python test_integration.py`：10 项集成烟测全部通过。

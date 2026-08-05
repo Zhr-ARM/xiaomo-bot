@@ -139,3 +139,17 @@ def test_polish_tone_drops_repeated_roleplay_vocative_and_generic_followup():
     assert "猫猫" not in polished
     assert "喵" not in polished
     assert "要不要" not in polished
+
+
+def test_decatify_keeps_a_separator_when_wave_joined_two_clauses():
+    polished = polish_tone(
+        "猫猫当然不在线下等你呀～小源只在群里在线（悄悄说）",
+        scene="casual_question",
+        style="brief",
+        explicit_trigger=True,
+        recent_assistant_replies=["本猫在窗台喵", "猫猫刚刚探头了🐾"],
+        current_text="我怎么没在6B504看到你",
+    )
+
+    assert "呀，小源" in polished
+    assert "悄悄说" not in polished
