@@ -59,7 +59,12 @@ from .intelligence import (
     post_check_reply,
 )
 from .interaction import JoinOpportunitySignals, decide_join_opportunity
-from .tone_polisher import build_tone_instruction, polish_tone
+from .persona import build_system_prompt
+from .tone_polisher import (
+    build_adaptive_style_instruction,
+    build_tone_instruction,
+    polish_tone,
+)
 from .weather import query_weather
 from .web_search import run_smart_search_result
 
@@ -459,14 +464,49 @@ def _is_silent_join_reply(reply: str) -> bool:
     return normalized in {"[SILENT]", "SILENT", "[不回复]", "不回复"}
 
 
-def _choose_local_light_reaction(text: str, chooser=random.choice) -> str | None:
+def _choose_local_light_reaction(
+    text: str,
+    chooser=random.choice,
+    avoid: list[str] | tuple[str, ...] | None = None,
+) -> str | None:
     lowered = (text or "").lower()
     if not lowered.strip():
         return None
+    avoided = {(item or "").strip() for item in (avoid or [])}
     for cues, replies in LOCAL_LIGHT_REACTION_RULES:
         if any(cue.lower() in lowered for cue in cues):
-            return str(chooser(replies))
+            available = [reply for reply in replies if reply not in avoided]
+            return str(chooser(available or replies))
     return None
+
+
+def _recent_assistant_replies(
+    group_id: str,
+    structured_history: list[dict] | None,
+    *,
+    limit: int = 6,
+) -> list[str]:
+    candidates = [
+        str(item.get("content") or "").strip()
+        for item in (structured_history or [])
+        if item.get("role") == "assistant" and str(item.get("content") or "").strip()
+    ]
+    candidates.extend(state.get_recent_bot_texts(group_id, limit=limit))
+    unique: list[str] = []
+    for text in candidates:
+        if text and (not unique or unique[-1] != text):
+            unique.append(text)
+    return unique[-max(1, int(limit)):]
+
+
+def _response_temperature(scene: str, *, proactive: bool) -> float:
+    if scene in {"technical_help", "live_info", "weather", "image_question"}:
+        return 0.55
+    if scene == "support":
+        return 0.68
+    if scene == "social_ack":
+        return 0.72
+    return 0.82 if proactive else 0.88
 
 
 def _typing_delay_seconds(
@@ -950,7 +990,7 @@ async def _process_messages(key: str, messages: list[dict]):
         try:
             await _send_group_reply(
                 bot, group_id,
-                "喵…小源刚才脑子短路了一下 (´;ω;`) 已经好啦，再说一次？"
+                "刚刚这边卡了一下，你再发一次试试。"
             )
         except Exception:
             pass
@@ -1056,9 +1096,6 @@ async def _process_messages_inner(
     )
     if ambient_context_block and not batch_context:
         combined_text = f"{combined_text}\n\n{ambient_context_block}"
-    combined_text = f"{combined_text}\n\n{frame_instruction}"
-    if join_instruction:
-        combined_text = f"{combined_text}\n\n{join_instruction}"
 
     context, meta, structured_history = await build_context(
         scene="group",
@@ -1152,7 +1189,7 @@ async def _process_messages_inner(
                     f"{combined_text}\n\n"
                     f"[系统指令：以下是实时联网搜索结果。"
                     f"你必须以搜索结果为准来回答，你的训练数据已过时不可信。"
-                    f"用你的猫娘风格转述搜索结果即可。"
+                    f"用自然群聊口吻转述搜索结果即可。"
                     f"如果搜索结果与用户问题明显不相关或全是无关内容，"
                     f"诚实告诉用户「没搜到相关内容，换个关键词试试」。"
                     f"不要假装有搜索结果，不要自己编。]\n{search_result.context}"
@@ -1185,10 +1222,33 @@ async def _process_messages_inner(
         proactive=bool(join_instruction),
         max_chars=reply_max_chars,
     )
-    combined_text = (
-        f"{combined_text}\n\n"
-        f"{build_humanize_instruction(strategy)}\n\n"
-        f"{tone_instruction}"
+    recent_assistant_replies = _recent_assistant_replies(
+        group_id,
+        structured_history,
+    )
+    adaptive_style_instruction = build_adaptive_style_instruction(
+        recent_group_messages=state.group_recent_texts.get(group_id, []),
+        recent_assistant_replies=recent_assistant_replies,
+        current_text=raw_text,
+        speaker_name=user_display,
+        scene=frame.scene,
+    )
+    dynamic_system_prompt = "\n\n".join(
+        part
+        for part in (
+            build_system_prompt(
+                scene="group",
+                user_profile=llm_profile,
+                mode=mode,
+                group_id=group_id,
+            ),
+            frame_instruction,
+            join_instruction,
+            build_humanize_instruction(strategy),
+            tone_instruction,
+            adaptive_style_instruction,
+        )
+        if part
     )
 
     if strategy.delay_seconds > 0:
@@ -1211,6 +1271,11 @@ async def _process_messages_inner(
                         structured_history=structured_history,
                         group_id=group_id,
                         max_tokens=max(128, min(1200, reply_max_chars * 2)),
+                        temperature=_response_temperature(
+                            frame.scene,
+                            proactive=bool(join_instruction),
+                        ),
+                        system_prompt=dynamic_system_prompt,
                     )
                     if join_instruction and _is_silent_join_reply(reply):
                         logger.info(
@@ -1241,6 +1306,9 @@ async def _process_messages_inner(
                         explicit_trigger=frame.explicit_trigger,
                         proactive=bool(join_instruction),
                         max_chars=reply_max_chars,
+                        recent_assistant_replies=recent_assistant_replies,
+                        speaker_name=user_display,
+                        current_text=raw_text,
                     )
                     print(f"[LLM] Reply received: len={len(reply)}")
                     # 情绪追踪：保持跨轮次角色连贯
@@ -1258,7 +1326,7 @@ async def _process_messages_inner(
                         )
                         _trace_proactive("llm_failure", group_id)
                         return
-                    reply = "喵呜...小源的脑子好像卡住了 (´;ω;`) 等下再试试好嘛？"
+                    reply = "刚刚没生成出来，等几秒再发我一次。"
                     print(f"[LLM] Exception: {e}")
     except TimeoutError:
         logger.warning("LLM lock timeout for group %s", group_id)
@@ -1273,7 +1341,7 @@ async def _process_messages_inner(
         try:
             await _send_group_reply(
                 bot, group_id,
-                "喵…刚才小源走神了！再说一遍好嘛？(´;ω;`)"
+                "刚刚没接上，你再发一次。"
             )
         except Exception:
             pass
@@ -1754,7 +1822,10 @@ async def _on_message(event: MessageEvent):
                                 join_decision.action == "react"
                                 and join_cfg.get("local_reactions_enabled", True)
                             ):
-                                local_reply = _choose_local_light_reaction(text)
+                                local_reply = _choose_local_light_reaction(
+                                    text,
+                                    avoid=state.get_recent_bot_texts(group_id_str),
+                                )
                                 if local_reply:
                                     candidate = local_reply
                             if local_reply:

@@ -284,6 +284,32 @@ def test_proactive_feedback_decreases_probability_after_stall():
     assert state.proactive_join_probability_multiplier("g1") < 1.0
 
 
+def test_recent_bot_texts_are_bounded_and_expire():
+    from src.plugins.xiaomo import state
+
+    state.group_recent_bot_texts.clear()
+    state.bot_reply_times.clear()
+    state.record_bot_reply("g1", text="第一句", now=100.0)
+    state.record_bot_reply("g1", text="第二句", now=101.0)
+
+    assert state.get_recent_bot_texts("g1", now=102.0) == ["第一句", "第二句"]
+    assert state.get_recent_bot_texts("g1", now=4001.0) == []
+
+
+def test_contextual_bubble_can_reach_rate_limit_gate():
+    decision = interaction.decide_interaction(
+        interaction.InteractionSignals(
+            reason="bubble",
+            candidate_text="机械制图那课最后真不教 CAD 吗？",
+            messages_last_5m=0,
+            bot_messages_last_5m=0,
+            seconds_since_bot_reply=3600,
+        )
+    )
+
+    assert decision.action != "silent"
+
+
 def test_busy_group_still_allows_a_light_opinion_join_when_bot_has_room():
     decision = interaction.decide_join_opportunity(
         interaction.JoinOpportunitySignals(

@@ -25,7 +25,11 @@ from src.plugins.xiaomo.memory import (
     store_memory,
 )
 from src.plugins.xiaomo.window import SilentWindow
-from src.plugins.xiaomo.auto_action import BUBBLE_QUOTES, check_repeat, detect_interesting_topic
+from src.plugins.xiaomo.auto_action import (
+    _clean_contextual_bubble,
+    check_repeat,
+    detect_interesting_topic,
+)
 from src.plugins.xiaomo.filter_utils import check_content_safe, extract_code_blocks
 
 
@@ -109,9 +113,10 @@ async def run_all():
         await compress_old_memories("group", user_qq=user_qq, group_id=group_id, threshold=999999)
         print("  OK - compression path completed without external call")
 
-        print("--- Test 10: Bubble Quotes ---")
-        assert len(BUBBLE_QUOTES) >= 10
-        print(f"  OK - {len(BUBBLE_QUOTES)} quotes available")
+        print("--- Test 10: Contextual Bubble Guard ---")
+        assert _clean_contextual_bubble("有人吗？") is None
+        assert _clean_contextual_bubble("机械制图最后真不教 CAD 吗？")
+        print("  OK - generic bubbles blocked, contextual follow-up kept")
 
         print()
         print("=" * 50)

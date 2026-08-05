@@ -17,6 +17,9 @@ group_message_times: dict[str, list[float]] = {}
 # 小源在各群的发言时间窗口：用于互动调速
 bot_reply_times: dict[str, list[float]] = {}
 
+# 小源最近实际发出的文本：用于避免连续复用同一句和同一套口癖
+group_recent_bot_texts: dict[str, list[dict]] = {}
+
 # 群消息缓存：用于复读检测
 group_recent_messages: dict[str, list[str]] = {}
 
@@ -98,12 +101,43 @@ def record_group_message(group_id: str, *, now: float | None = None) -> None:
     group_message_times[group_id] = times
 
 
-def record_bot_reply(group_id: str, *, now: float | None = None) -> None:
+def record_bot_reply(
+    group_id: str,
+    *,
+    text: str = "",
+    now: float | None = None,
+) -> None:
     if now is None:
         now = time.time()
     times = trim_recent_times(bot_reply_times, group_id, now=now)
     times.append(now)
     bot_reply_times[group_id] = times
+    clean = (text or "").strip()
+    if clean:
+        recent = [
+            item
+            for item in group_recent_bot_texts.get(group_id, [])
+            if now - float(item.get("time", 0)) <= 3600
+        ]
+        recent.append({"time": now, "text": clean[:400]})
+        group_recent_bot_texts[group_id] = recent[-20:]
+
+
+def get_recent_bot_texts(
+    group_id: str,
+    *,
+    limit: int = 6,
+    now: float | None = None,
+) -> list[str]:
+    if now is None:
+        now = time.time()
+    recent = [
+        item
+        for item in group_recent_bot_texts.get(group_id, [])
+        if now - float(item.get("time", 0)) <= 3600
+    ]
+    group_recent_bot_texts[group_id] = recent[-20:]
+    return [str(item.get("text") or "") for item in recent[-max(1, int(limit)):]]
 
 
 def record_recent_group_text(

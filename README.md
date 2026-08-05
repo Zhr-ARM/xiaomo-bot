@@ -10,9 +10,10 @@
 - **用户画像** — 自动记录群成员发言习惯和技术方向
 - **天气查询** — 自动识别提问中的城市，支持自然语言查询和每日定时推送
 - **静默窗口** — 聚合连续消息再回复，模拟真人聊天节奏
+- **语感自适应** — 跟随近期群聊句长，抑制重复口癖、舞台动作和习惯性反问
 - **特殊模式** — 夸夸、点草（友好吐槽）、嵌入式冷笑话
 - **视觉识别** — 支持图片描述（需配置 Vision API）
-- **自动冒泡** — 长时间冷场自动卖萌
+- **上下文冒泡** — 只在存在具体未完话题时自然跟进，没有合适内容就保持安静
 - **复读检测** — 群聊复读梗自动跟上
 - **戳一戳回复** — 被戳会随机回复卖萌语录
 
@@ -168,6 +169,7 @@ xiaomo-bot/
 │   ├── vector_store.py     # 向量语义搜索 (ChromaDB)
 │   ├── window.py           # 静默窗口管理器
 │   ├── humanize.py         # 类人化回复策略（该不该回、怎么回、等多久）
+│   ├── tone_polisher.py    # 群聊节奏感知、抗重复和最终语气整理
 │   ├── auto_action.py      # 自动冒泡、复读检测
 │   ├── weather.py          # 天气查询 & 定时推送
 │   ├── vision.py           # 图片识别
@@ -271,7 +273,7 @@ poke_everyone_cooldown_minutes: 0
 
 # 自动行为
 auto_action:
-  bubble_inactive_minutes: 30    # 多少分钟无消息触发冒泡
+  bubble_inactive_minutes: 30    # 多少分钟无消息后检查是否有具体未完话题
   bubble_max_inactive_minutes: 180 # 沉寂太久后不再凭空冒泡
   bubble_cooldown_minutes: 60    # 冒泡冷却
   bubble_attempt_cooldown_minutes: 15 # AI 拒绝后多久再尝试

@@ -54,6 +54,28 @@ def test_fallback_strategy_uses_profile_warmth_and_short_style():
     assert strategy.delay_seconds > 0
 
 
+def test_casual_why_question_is_not_mistaken_for_technical_help():
+    strategy = humanize.fallback_strategy(
+        raw_text="我怎么没在6B504看到你",
+        context="",
+        user_profile={"exists": True, "total_messages": 5},
+    )
+
+    assert strategy.reply_style == "brief"
+    assert strategy.scene_label == "casual_chat"
+
+
+def test_anxiety_uses_supportive_style():
+    strategy = humanize.fallback_strategy(
+        raw_text="要考试了好焦虑",
+        context="",
+        user_profile={"exists": True, "total_messages": 5},
+    )
+
+    assert strategy.reply_style == "supportive"
+    assert strategy.scene_label == "support"
+
+
 def test_humanize_instruction_encourages_brief_human_reply():
     strategy = humanize.ReplyStrategy(
         reply_style="brief",
@@ -66,6 +88,7 @@ def test_humanize_instruction_encourages_brief_human_reply():
 
     assert "只接一句" in text
     assert "不要把每次回复都写成完整答案" in text
+    assert "一轮只做一个主要动作" in text
     assert "casual_chat" in text
 
 

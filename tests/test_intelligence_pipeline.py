@@ -104,6 +104,16 @@ def test_local_light_reaction_handles_small_banter():
     assert reply == "笑死"
 
 
+def test_local_light_reaction_avoids_the_last_exact_reply():
+    reply = handlers._choose_local_light_reaction(
+        "哈哈哈哈",
+        chooser=lambda replies: replies[0],
+        avoid=["笑死"],
+    )
+
+    assert reply == "这句有点绷不住"
+
+
 def test_typing_delay_caps_proactive_react():
     delay = handlers._typing_delay_seconds(
         "这是一句轻反应",

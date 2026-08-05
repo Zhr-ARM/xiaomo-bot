@@ -69,6 +69,7 @@ def build_system_prompt(
             p.append(f"- 昵称：{user_profile['nickname']}")
         if user_profile.get("nicknames"):
             p.append(f"- 其他称呼：{', '.join(user_profile['nicknames'])}")
+            p.append("- 其他称呼仅作识别参考；除非本轮语境也在用，否则仍以当前群名片称呼。")
         if user_profile.get("total_messages"):
             p.append(f"- 已互动 {user_profile['total_messages']} 条消息")
         profile_data = user_profile.get("profile", {})
@@ -84,16 +85,19 @@ def build_system_prompt(
         current_mood = get_group_mood(group_id)
         if current_mood:
             mood_hints = {
-                "snarky": "还在毒舌损人模式——保持这个调调但可以自然过渡，别突然变脸",
-                "playful": "还在调皮捣蛋模式——保持这个调调但可以自然过渡，别突然变脸",
-                "gentle": "还在温柔善良模式——保持这个调调但可以自然过渡，别突然变脸",
-                "energetic": "还在元气满满模式——保持这个调调但可以自然过渡，别突然变脸",
-                "elegant": "还在优雅知性模式——保持这个调调但可以自然过渡，别突然变脸",
-                "cute": "还在可爱撒娇模式——保持这个调调但可以自然过渡，别突然变脸",
+                "snarky": "上一轮语气偏调侃；如果本轮仍在开玩笑，可以延续一点，但别主动加码",
+                "playful": "上一轮比较轻松；本轮话题没变时可以保持随意",
+                "gentle": "上一轮语气偏柔和；本轮仍是情绪话题时保持稳一点",
+                "energetic": "上一轮节奏偏快；本轮可以稍活泼，但不用连续感叹",
+                "elegant": "上一轮表达偏克制；本轮可以继续简洁清楚",
+                "cute": "上一轮稍微卖了个萌；本轮先回到普通聊天，别连续表演人设",
             }
             hint = mood_hints.get(current_mood["mood"], "")
             if hint:
-                parts.append(f"\n## 当前情绪状态\n你刚才{hint}。")
+                parts.append(
+                    f"\n## 最近语气惯性\n你刚才{hint}。当前消息的语气优先，"
+                    "不要为了延续状态而硬演。"
+                )
 
     if mode == "praise":
         parts.append(

@@ -76,6 +76,43 @@ def test_casual_frame_keeps_reply_short_and_tool_free():
     assert frame.tool_plan.needs_search is False
 
 
+def test_personal_share_does_not_become_live_info_just_because_it_says_today():
+    frame = intelligence.build_conversation_frame(
+        current_msg={"user_qq": "u1"},
+        raw_text="我今天终于把板子焊完了",
+        explicit_trigger=True,
+    )
+
+    assert frame.scene == "personal_share"
+    assert frame.max_chars <= 160
+    assert frame.tool_plan.needs_search is False
+
+
+def test_social_ack_is_kept_to_half_a_sentence():
+    frame = intelligence.build_conversation_frame(
+        current_msg={"user_qq": "u1"},
+        raw_text="谢谢啦",
+        explicit_trigger=True,
+    )
+
+    assert frame.scene == "social_ack"
+    assert frame.max_chars <= 60
+
+
+def test_anxious_message_is_support_not_banter():
+    assert intelligence.classify_scene("要考试了好焦虑", explicit_trigger=True) == "support"
+
+
+def test_long_colloquial_question_stays_casual():
+    assert (
+        intelligence.classify_scene(
+            "我怎么没在6B504看到猫娘",
+            explicit_trigger=True,
+        )
+        == "casual_question"
+    )
+
+
 def test_post_check_strips_prompt_leakage_and_trims():
     frame = intelligence.ConversationFrame(
         current_user_qq="u1",

@@ -21,7 +21,17 @@ class _NoneBotHandler(logging.Handler):
             self.handleError(record)
 
 
+class _SuppressHealthAccess(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return "/healthz" not in message and "/readyz" not in message
+
+
 def configure_logging() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, _SuppressHealthAccess) for item in access_logger.filters):
+        access_logger.addFilter(_SuppressHealthAccess())
+
     root = logging.getLogger("xiaomo")
     if any(isinstance(handler, _NoneBotHandler) for handler in root.handlers):
         return

@@ -438,7 +438,7 @@ async def get_context_messages(
     elif scene == "group" and group_id:
         stmt = stmt.where(Message.group_id == group_id)
 
-    stmt = stmt.order_by(desc(Message.created_at)).limit(limit)
+    stmt = stmt.order_by(desc(Message.created_at), desc(Message.id)).limit(limit)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 

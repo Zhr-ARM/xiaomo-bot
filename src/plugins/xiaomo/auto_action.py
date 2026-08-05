@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Awaitable, Callable
@@ -24,20 +25,12 @@ from .llm import get_llm
 logger = logging.getLogger("xiaomo.auto_action")
 CST = timezone(timedelta(hours=8))
 
-BUBBLE_QUOTES = [
-    "刚才那个事后来解决没？",
-    "所以最后咋定的？",
-    "我有点好奇，后续呢",
-    "刚才那段还有下文吗",
-    "这个坑最后填上没？",
-    "你们刚聊的那个，有结论了吗",
-    "说到一半没了，后来咋样",
-    "这事我还惦记着，搞定了吗",
-    "刚才那个思路有人试了吗",
-    "最后用的是哪个方案？",
-]
-
 _bubble_task: asyncio.Task | None = None
+
+_GENERIC_BUBBLE_RE = re.compile(
+    r"^(?:有人吗|有人在吗|在吗|怎么没人说话|群里好安静|冒个泡|"
+    r"刚才那个(?:事|话题)?后来咋样|所以最后咋样|后来呢|有后续吗)[？?。!！～~]*$"
+)
 
 
 # ─── 主动发言决策 ─────────────────────────────────────────────────────────────
@@ -86,7 +79,7 @@ def _parse_proactive_decision(reply: str) -> bool:
 async def _recent_group_context(group_id: str, limit: int = 8) -> str:
     try:
         from sqlalchemy import desc, select
-        from .database import Message, get_session
+        from .database import Message, get_session, get_user_display_names
 
         async with await get_session() as session:
             result = await session.execute(
@@ -96,15 +89,83 @@ async def _recent_group_context(group_id: str, limit: int = 8) -> str:
                 .limit(limit)
             )
             messages = list(reversed(result.scalars().all()))
+            display_names = await get_user_display_names(
+                session,
+                {msg.user_qq for msg in messages if msg.user_qq},
+            )
     except Exception:
         logger.exception("Failed to load recent context for proactive decision")
         return ""
 
     lines = []
     for msg in messages:
-        speaker = "小源" if msg.role == "assistant" else f"成员{msg.user_qq or ''}"
+        speaker = (
+            "小源"
+            if msg.role == "assistant"
+            else display_names.get(msg.user_qq or "", f"成员{msg.user_qq or ''}")
+        )
         lines.append(f"{speaker}: {(msg.content or '')[:160]}")
     return "\n".join(lines)
+
+
+def _clean_contextual_bubble(reply: str) -> str | None:
+    text = (reply or "").strip().strip("`").strip()
+    if not text or text.upper() in {"[SILENT]", "SILENT"} or text in {"不发", "不回复"}:
+        return None
+    text = re.sub(r"^(?:消息|回复|发言)[:：]\s*", "", text)
+    text = " ".join(line.strip() for line in text.splitlines() if line.strip())
+    if not text or _GENERIC_BUBBLE_RE.fullmatch(text):
+        return None
+    from .tone_polisher import polish_tone
+
+    cleaned = polish_tone(
+        text,
+        scene="group_flow",
+        style="brief",
+        explicit_trigger=False,
+        proactive=True,
+        max_chars=80,
+        recent_assistant_replies=[],
+        current_text="",
+    )
+    return cleaned or None
+
+
+async def _generate_contextual_bubble(group_id: str, recent_context: str) -> str | None:
+    prompt = (
+        "下面是一个 QQ 群在 30 到 180 分钟前的最后几句聊天。判断是否有一个具体、"
+        "尚未收尾而且现在接回去不突兀的话题。\n"
+        "有的话，只写一句 8 到 45 字的自然跟进，必须点出上下文里的具体对象，"
+        "例如课程、板子、报错或方案；不要说‘刚才那个’‘有人吗’‘后来呢’。\n"
+        "没有明确可接内容、只是寒暄或话题已经结束，就只输出 [SILENT]。\n"
+        "不要自我介绍，不写括号动作，不虚构自己在线下见过或做过什么。\n\n"
+        f"群号：{group_id}\n近期聊天：\n{recent_context[:2400]}"
+    )
+    try:
+        async with asyncio.timeout(12):
+            reply = await get_llm().chat(
+                context="",
+                user_profile=None,
+                scene="group",
+                user_message=prompt,
+                mode="normal",
+                structured_history=None,
+                group_id=group_id,
+                max_tokens=100,
+                temperature=0.72,
+                system_prompt=(
+                    "你是群聊跟进编辑器。宁可输出 [SILENT] 也不要为了活跃而找话说；"
+                    "只输出最终消息或 [SILENT]。"
+                ),
+            )
+    except Exception:
+        logger.exception("Contextual bubble generation failed: group=%s", group_id)
+        return None
+    return _clean_contextual_bubble(reply)
+
+
+async def _approve_generated_bubble(_payload: dict) -> bool:
+    return True
 
 
 async def _default_proactive_ai_decider(payload: dict) -> bool:
@@ -263,7 +324,8 @@ async def start_bubble_loop():
                 if random.random() < 0.5:
                     continue
 
-                quote = random.choice(BUBBLE_QUOTES)
+                if is_quiet_hours():
+                    continue
                 recent_context = await _recent_group_context(gid)
                 if not recent_context:
                     continue
@@ -271,11 +333,16 @@ async def start_bubble_loop():
                 from .runtime_state import schedule_persist
 
                 schedule_persist()
+                quote = await _generate_contextual_bubble(gid, recent_context)
+                if not quote:
+                    logger.info("Contextual bubble stayed silent: group=%s", gid)
+                    continue
                 if not await should_send_proactive_message(
                     group_id=gid,
                     reason="bubble",
                     candidate_text=quote,
                     recent_context=recent_context,
+                    ai_decider=_approve_generated_bubble,
                 ):
                     continue
                 try:

@@ -34,7 +34,7 @@ async def send_group_text(
         raise ValueError("group text cannot be empty")
 
     result = await bot.send_group_msg(group_id=int(group_id), message=clean)
-    state.record_bot_reply(group_id)
+    state.record_bot_reply(group_id, text=clean)
     from .runtime_state import schedule_persist
 
     schedule_persist()

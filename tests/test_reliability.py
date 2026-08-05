@@ -221,6 +221,36 @@ def test_quiet_hours_cross_midnight():
     assert not auto_action.is_quiet_hours(datetime(2026, 6, 16, 12, 0, tzinfo=cst))
 
 
+def test_contextual_bubble_rejects_generic_presence_checks():
+    assert auto_action._clean_contextual_bubble("有人吗？") is None
+    assert auto_action._clean_contextual_bubble("刚才那个后来咋样？") is None
+    assert (
+        auto_action._clean_contextual_bubble("机械制图那课最后真不教 CAD 吗？")
+        == "机械制图那课最后真不教 CAD 吗？"
+    )
+
+
+@pytest.mark.asyncio
+async def test_contextual_bubble_generation_uses_one_grounded_message(monkeypatch):
+    calls = []
+
+    class FakeLLM:
+        async def chat(self, **kwargs):
+            calls.append(kwargs)
+            return "消息：机械制图那课最后真不教 CAD 吗？"
+
+    monkeypatch.setattr(auto_action, "get_llm", lambda: FakeLLM())
+
+    result = await auto_action._generate_contextual_bubble(
+        "g1",
+        "A: 我们专业机械制图居然不教 CAD",
+    )
+
+    assert result == "机械制图那课最后真不教 CAD 吗？"
+    assert calls[0]["temperature"] == 0.72
+    assert "具体对象" in calls[0]["user_message"]
+
+
 @pytest.mark.asyncio
 async def test_proactive_decision_blocks_quiet_hours_without_ai():
     cst = timezone(timedelta(hours=8))

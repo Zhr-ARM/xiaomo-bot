@@ -190,7 +190,10 @@ async def build_context(
             summary_stmt = summary_stmt.where(ContextSummary.user_qq == user_qq)
         elif scene == "group" and group_id:
             summary_stmt = summary_stmt.where(ContextSummary.group_id == group_id)
-        summary_stmt = summary_stmt.order_by(desc(ContextSummary.created_at)).limit(5)
+        summary_stmt = summary_stmt.order_by(
+            desc(ContextSummary.created_at),
+            desc(ContextSummary.id),
+        ).limit(5)
         summary_result = await session.execute(summary_stmt)
         summaries = list(summary_result.scalars().all())
 
@@ -210,7 +213,7 @@ async def build_context(
                     Message.user_qq == user_qq,
                     Message.role == "user",
                 )
-                .order_by(desc(Message.created_at))
+                .order_by(desc(Message.created_at), desc(Message.id))
                 .limit(30)
             )
             user_history_result = await session.execute(user_history_stmt)
@@ -395,7 +398,7 @@ async def compress_old_memories(
         elif scene == "group" and group_id:
             stmt = stmt.where(Message.group_id == group_id)
 
-        stmt = stmt.order_by(desc(Message.created_at))
+        stmt = stmt.order_by(desc(Message.created_at), desc(Message.id))
         result = await session.execute(stmt)
         messages = list(result.scalars().all())
 
@@ -438,8 +441,8 @@ async def compress_old_memories(
             group_id=group_id,
             scene=scene,
             summary=summary_text,
-            start_message_id=compress_batch[-1].id,
-            end_message_id=compress_batch[0].id,
+            start_message_id=min(m.id for m in compress_batch),
+            end_message_id=max(m.id for m in compress_batch),
         )
         session.add(compressed)
 

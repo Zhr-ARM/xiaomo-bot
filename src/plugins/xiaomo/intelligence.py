@@ -17,15 +17,22 @@ TECHNICAL_CUES = (
     "bug", "报错", "异常", "怎么修", "咋修", "配置", "代码", "编译", "运行",
     "接口", "数据库", "python", "node", "git", "部署", "依赖", "环境",
 )
-SUPPORT_CUES = ("难受", "崩了", "烦", "寄了", "救命", "不会了", "裂开", "累")
+SUPPORT_CUES = (
+    "难受", "崩了", "烦", "寄了", "救命", "不会了", "裂开", "累", "焦虑",
+    "害怕", "压力", "失眠", "想哭", "委屈", "孤独", "撑不住", "顶不住",
+)
 IMAGE_CUES = ("图片", "图", "看图", "识图", "识别", "这张图", "那个图")
 WEATHER_CUES = (
     "天气", "天气预报", "冷不冷", "热不热", "下雨", "带伞", "几度", "多少度",
     "温度", "气温", "降温", "刮风", "风大", "外面冷", "外面热",
 )
-LIVE_CUES = (
-    "现在", "今天", "今日", "最近", "最新", "刚刚", "新闻", "热搜", "比赛",
-    "战报", "比分", "赛程", "版本", "发布", "更新", "排行", "榜单",
+SOCIAL_ACK_RE = re.compile(
+    r"^(?:谢了|谢谢|多谢|不客气|收到|懂了|明白了|好嘞|行|可以|早|早上好|"
+    r"晚上好|晚安|你好|嗨|拜拜|回头见)[啊呀啦呢哈～~!！。]*$"
+)
+PERSONAL_SHARE_CUES = (
+    "我刚", "我今天", "我终于", "我准备", "我打算", "我发现", "我感觉",
+    "我好像", "我已经", "我现在", "刚刚我", "终于把", "总算把",
 )
 
 
@@ -61,19 +68,28 @@ def _contains_any(text: str, cues: tuple[str, ...]) -> bool:
 
 
 def classify_scene(text: str, *, explicit_trigger: bool = False) -> str:
-    if not text.strip():
+    clean = text.strip()
+    if not clean:
         return "empty"
-    if _contains_any(text, WEATHER_CUES):
+    if _contains_any(clean, WEATHER_CUES):
         return "weather"
-    if _contains_any(text, IMAGE_CUES):
+    if _contains_any(clean, IMAGE_CUES):
         return "image_question"
-    if _contains_any(text, TECHNICAL_CUES):
+    if _contains_any(clean, TECHNICAL_CUES):
         return "technical_help"
-    if _contains_any(text, SUPPORT_CUES):
+    if _contains_any(clean, SUPPORT_CUES):
         return "support"
-    if detect_explicit_search(text) or _contains_any(text, LIVE_CUES):
+    if SOCIAL_ACK_RE.fullmatch(clean):
+        return "social_ack"
+    if detect_explicit_search(clean) or is_natural_candidate(clean):
         return "live_info"
-    if len(text.strip()) <= 14 or any(p in text for p in ("?", "？", "吗", "呢")):
+    if _contains_any(clean, PERSONAL_SHARE_CUES):
+        return "personal_share"
+    has_question_shape = any(
+        cue in clean
+        for cue in ("?", "？", "吗", "呢", "怎么", "咋", "为什么", "为何", "谁", "哪", "什么", "多少")
+    )
+    if len(clean) <= 14 or has_question_shape:
         return "casual_question" if explicit_trigger else "casual_banter"
     return "group_flow"
 
@@ -180,6 +196,14 @@ def build_conversation_frame(
         tone = "playful_brief"
         goal = "短短接住，可以反问，别展开成长答案。"
         max_chars = 180
+    elif scene == "personal_share":
+        tone = "warm_brief"
+        goal = "回应分享里最具体的那一点，别复述、别默认追问，也别追加未被请求的建议。"
+        max_chars = 160
+    elif scene == "social_ack":
+        tone = "brief"
+        goal = "像群友一样顺手回半句，不延伸新话题。"
+        max_chars = 60
 
     return ConversationFrame(
         current_user_qq=str(current_msg.get("user_qq") or ""),

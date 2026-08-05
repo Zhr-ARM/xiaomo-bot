@@ -148,7 +148,9 @@ def decide_interaction(signals: InteractionSignals) -> InteractionDecision:
         reasons.append("explicit trigger")
 
     reason_weights = {
-        "bubble": -12,
+        # Contextual bubbles already passed a strict "specific unfinished topic"
+        # generator. Keep them eligible for the normal rate and quiet-hour gates.
+        "bubble": -2,
         "repeat": -8,
         "reaction": 0,
         "topic_engage": 8,
@@ -168,7 +170,11 @@ def decide_interaction(signals: InteractionSignals) -> InteractionDecision:
     if signals.user_total_messages >= 50:
         score += 5
         reasons.append("familiar user")
-    elif signals.user_total_messages <= 2 and not signals.explicit_trigger:
+    elif (
+        signals.user_total_messages <= 2
+        and not signals.explicit_trigger
+        and signals.reason != "bubble"
+    ):
         score -= 5
 
     if not signals.explicit_trigger:

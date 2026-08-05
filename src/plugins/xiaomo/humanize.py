@@ -32,6 +32,12 @@ STYLE_HINTS = {
     "supportive": "语气稳一点，先接住情绪，再给一点具体帮助。",
 }
 
+WARMTH_HINTS = {
+    "newcomer": "还不熟，友好直接即可，不用亲昵称呼，也别假装有共同经历。",
+    "regular": "已经见过一些发言，语气可以放松，但只引用上下文里确实出现过的事。",
+    "familiar": "可以像熟悉群友一样自然，但旧外号或旧梗只有当前语境也在用时才接。",
+}
+
 
 @dataclass
 class ReplyStrategy:
@@ -146,10 +152,14 @@ def fallback_strategy(
         )
 
     technical_keywords = [
-        "bug", "报错", "异常", "怎么", "如何", "为什么", "配置", "代码",
-        "编译", "运行", "接口", "模型", "python", "git", "数据库",
+        "bug", "报错", "异常", "怎么修", "咋修", "配置", "代码", "编译",
+        "运行失败", "接口", "模型", "python", "git", "数据库", "串口",
+        "电路", "芯片", "寄存器", "部署", "依赖",
     ]
-    supportive_keywords = ["难受", "崩了", "烦", "寄了", "救命", "不会了"]
+    supportive_keywords = [
+        "难受", "崩了", "烦", "寄了", "救命", "不会了", "焦虑", "害怕",
+        "压力", "失眠", "想哭", "委屈", "孤独", "撑不住", "顶不住",
+    ]
 
     if any(kw.lower() in text.lower() for kw in technical_keywords):
         delay = min(3.8, 1.2 + len(text) / 80)
@@ -172,13 +182,20 @@ def fallback_strategy(
             reason="supportive cue",
         )
 
-    if len(text) <= 12 or "吗" in text or "？" in text or "?" in text:
+    casual_question_cues = ("怎么", "咋", "为什么", "为何", "谁", "哪", "什么", "多少")
+    if (
+        len(text) <= 12
+        or "吗" in text
+        or "？" in text
+        or "?" in text
+        or any(cue in text for cue in casual_question_cues)
+    ):
         return ReplyStrategy(
             reply_style="brief",
             delay_seconds=1.0,
             scene_label="casual_chat",
             warmth=warmth,
-            instruction="短短接一句即可，必要时反问，不要展开。",
+            instruction="短短接一句即可。只有缺少关键信息时才反问，别习惯性把问题丢回去。",
             reason="short casual cue",
         )
 
@@ -310,14 +327,16 @@ async def decide_reply_strategy(
 
 def build_humanize_instruction(strategy: ReplyStrategy) -> str:
     style_hint = STYLE_HINTS.get(strategy.reply_style, STYLE_HINTS["brief"])
+    warmth_hint = WARMTH_HINTS.get(strategy.warmth, WARMTH_HINTS["regular"])
     return (
         "[回复策略]\n"
         f"- 是否回复：{'是' if strategy.should_reply else '否'}\n"
         f"- 当前场景：{strategy.scene_label}\n"
-        f"- 关系温度：{strategy.warmth}\n"
+        f"- 关系温度：{strategy.warmth}。{warmth_hint}\n"
         f"- 回复形态：{strategy.reply_style}，{style_hint}\n"
         f"- 本轮具体要求：{strategy.instruction}\n"
         "- 不要把每次回复都写成完整答案；先像真人一样判断场合。\n"
+        "- 一轮只做一个主要动作，不要同时寒暄、复述、解释、建议、再反问。\n"
         "- 可以承认误读或不确定；需要更多信息时先反问。\n"
         "- 别复述这些策略文字，直接按策略自然说话。"
     )

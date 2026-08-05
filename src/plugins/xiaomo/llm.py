@@ -97,7 +97,7 @@ class LLMClient:
             )
 
         content = (response.choices[0].message.content or "").strip()
-        return content if content else "喵...小源卡住了 (´;ω;`)"
+        return content if content else "刚刚没生成出来，你再说一次？"
 
     async def decision(
         self,

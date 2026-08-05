@@ -6,8 +6,8 @@ from .observability import configure_logging
 
 __plugin_meta__ = PluginMetadata(
     name="小源",
-    description="一只可爱的猫娘QQ聊天机器人 (｡･ω･｡)",
-    usage="仅支持群聊：@小源或叫小源即可触发喵~",
+    description="自然参与群聊、能认真处理技术问题的小源",
+    usage="仅支持群聊：@小源或直接叫小源即可触发",
     config=None,
 )
 

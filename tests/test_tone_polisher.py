@@ -4,7 +4,11 @@ import nonebot
 
 nonebot.init()
 
-from src.plugins.xiaomo.tone_polisher import build_tone_instruction, polish_tone
+from src.plugins.xiaomo.tone_polisher import (
+    build_adaptive_style_instruction,
+    build_tone_instruction,
+    polish_tone,
+)
 
 
 def test_polish_tone_removes_formal_answer_shell_for_casual_chat():
@@ -77,3 +81,61 @@ def test_tone_instruction_exposes_reply_budget():
     assert "[TONE_POLISH]" in instruction
     assert "max_chars: 160" in instruction
     assert "proactive_join: yes" in instruction
+
+
+def test_adaptive_style_matches_short_group_rhythm_and_stops_question_reflex():
+    instruction = build_adaptive_style_instruction(
+        recent_group_messages=[
+            {"text": "笑死"},
+            {"text": "确实"},
+            {"text": "刚装好"},
+        ],
+        recent_assistant_replies=[],
+        current_text="我终于把环境装好了",
+        speaker_name="Tony",
+        scene="personal_share",
+    )
+
+    assert "6-35 字" in instruction
+    assert "默认不要在结尾再抛一个问题" in instruction
+    assert "不要顺手追加教程" in instruction
+    assert "Tony同学" in instruction
+
+
+def test_adaptive_style_detects_recent_roleplay_habits():
+    instruction = build_adaptive_style_instruction(
+        recent_group_messages=[],
+        recent_assistant_replies=[
+            "喵～（尾巴晃了晃）这个确实",
+            "本猫也觉得离谱🐾",
+        ],
+        current_text="太抽象了",
+        scene="casual_banter",
+    )
+
+    assert "喵、本猫、猫系颜文字" in instruction
+    assert "括号里的耳朵尾巴动作" in instruction
+
+
+def test_polish_tone_drops_repeated_roleplay_vocative_and_generic_followup():
+    polished = polish_tone(
+        "Tony同学，（悄悄说）猫猫也觉得这事离谱喵～！要不要再聊聊？",
+        scene="personal_share",
+        style="brief",
+        explicit_trigger=True,
+        max_chars=180,
+        recent_assistant_replies=[
+            "Tony，你说得对喵",
+            "（尾巴晃了晃）本猫懂了🐾",
+        ],
+        speaker_name="Tony",
+        current_text="这事真的太离谱了",
+    )
+
+    assert "同学" not in polished
+    assert "耳朵" not in polished
+    assert "悄悄说" not in polished
+    assert "本猫" not in polished
+    assert "猫猫" not in polished
+    assert "喵" not in polished
+    assert "要不要" not in polished
