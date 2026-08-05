@@ -55,19 +55,19 @@ proactive:
 # 主动插话机会评分（非 @ 时只在合适空位短接一句）
 proactive_join:
   enabled: true
-  min_cooldown_seconds: 150
+  min_cooldown_seconds: 90
   window_seconds: 0.9
   recent_context_messages: 8
   local_reactions_enabled: true
   post_check:
     enabled: true
-    stale_seconds: 30
-    cancel_after_human_messages: 3
+    stale_seconds: 55
+    cancel_after_human_messages: 8
     cancel_if_bot_spoke: true
   probability:
-    react: 0.38
-    short_reply: 0.68
-    helpful_reply: 0.88
+    react: 0.55
+    short_reply: 0.82
+    helpful_reply: 0.95
 
 # 发送节奏：模拟打字时间，显式 @ 保持快，主动插话保持短
 human_timing:
@@ -83,7 +83,10 @@ human_timing:
 humanize:
   enabled: true
   strategy_llm_for_explicit: false # 明确 @/to_me 不额外调用策略 LLM，保证响应速度
+  strategy_llm_for_proactive: false # 主动接话由正式回复模型一次完成“判断+作答”
   explicit_max_delay_seconds: 0.3 # 明确 @ 后最多只额外等 0.3 秒再开始请求 LLM
+  proactive_strategy_max_delay_seconds: 0.4 # 主动接话已另有打字延迟，策略层不再长时间等待
+  proactive_fallback_max_delay_seconds: 0.2
   strategy_timeout_seconds: 12  # 策略判断超时则走本地回退策略
   max_extra_delay_seconds: 5    # 策略允许添加的最大额外等待
 
@@ -128,8 +131,8 @@ auto_poke_targets:
     match_by: "qq"
     cooldown_minutes: 5
 
-# 通用戳戳：任何人发言，每隔 N 分钟戳一次（0 = 关闭）
-poke_everyone_cooldown_minutes: 30
+# 通用戳戳：关闭，避免每位群友首次发言都占用一次 AI 审批并干扰文字接话
+poke_everyone_cooldown_minutes: 0
 
 # 主动戳戳：遇到感兴趣的话题时戳一下发言者
 poke_topic:

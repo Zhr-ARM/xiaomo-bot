@@ -18,8 +18,8 @@ async def _startup():
     from .database import init_database
     await init_database()
 
-    from .vector_store import init_vector_store
-    await init_vector_store()
+    from .vector_store import start_vector_store_init
+    start_vector_store_init()
 
     from .handlers import setup_silent_callback
     setup_silent_callback()

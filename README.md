@@ -206,7 +206,7 @@ memory:
   compress_threshold_tokens: 15000 # 触发压缩的阈值
   keep_recent_messages: 50        # 始终保留最近 N 条
 
-# 向量语义搜索
+# 向量语义搜索（后台初始化，不阻塞机器人上线）
 vector:
   model: "BAAI/bge-small-zh-v1.5" # 嵌入模型
   search_results: 10
@@ -221,7 +221,10 @@ silent_window:
 humanize:
   enabled: true
   strategy_llm_for_explicit: false
+  strategy_llm_for_proactive: false # 正式回复模型一次完成主动接话判断和生成
   explicit_max_delay_seconds: 0.3
+  proactive_strategy_max_delay_seconds: 0.4
+  proactive_fallback_max_delay_seconds: 0.2
   strategy_timeout_seconds: 12
   max_extra_delay_seconds: 5
 
@@ -237,19 +240,19 @@ proactive:
 # 主动接话（非 @ 时自然加入聊天）
 proactive_join:
   enabled: true
-  min_cooldown_seconds: 150
+  min_cooldown_seconds: 90
   window_seconds: 0.9
   recent_context_messages: 8
   local_reactions_enabled: true
   post_check:
     enabled: true
-    stale_seconds: 30
-    cancel_after_human_messages: 3
+    stale_seconds: 55
+    cancel_after_human_messages: 8
     cancel_if_bot_spoke: true
   probability:
-    react: 0.38
-    short_reply: 0.68
-    helpful_reply: 0.88
+    react: 0.55
+    short_reply: 0.82
+    helpful_reply: 0.95
 
 # 发送节奏（模拟真人打字，显式 @ 会保持快）
 human_timing:
@@ -260,6 +263,9 @@ human_timing:
   max_seconds: 3.0
   explicit_max_seconds: 0.8
   proactive_max_seconds: 1.2
+
+# 全员自动戳会占用 AI 判断并干扰文字接话，默认关闭；指定成员和话题戳仍可用
+poke_everyone_cooldown_minutes: 0
 
 # 自动行为
 auto_action:

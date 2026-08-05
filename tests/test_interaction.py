@@ -235,6 +235,7 @@ def test_proactive_feedback_increases_probability_after_human_reply():
     from src.plugins.xiaomo import state
 
     state.proactive_join_feedback.clear()
+    state.proactive_join_last_time.clear()
     state.mark_proactive_join_sent("g1", now=100.0)
 
     outcome = state.observe_proactive_join_feedback(
@@ -242,6 +243,7 @@ def test_proactive_feedback_increases_probability_after_human_reply():
     )
 
     assert outcome == "continued"
+    assert state.proactive_join_last_time["g1"] == 100.0
     assert state.proactive_join_probability_multiplier("g1") > 1.0
 
 
@@ -257,3 +259,33 @@ def test_proactive_feedback_decreases_probability_after_stall():
 
     assert outcome == "stalled"
     assert state.proactive_join_probability_multiplier("g1") < 1.0
+
+
+def test_busy_group_still_allows_a_light_opinion_join_when_bot_has_room():
+    decision = interaction.decide_join_opportunity(
+        interaction.JoinOpportunitySignals(
+            trigger_text="我们专业机械制图居然不教 CAD",
+            messages_last_5m=12,
+            bot_messages_last_5m=0,
+            seconds_since_bot_reply=1200,
+            human_messages_since_bot=12,
+        )
+    )
+
+    assert decision.action in {"react", "short_reply", "helpful_reply"}
+
+
+def test_join_opportunity_hard_caps_bot_at_two_messages_per_five_minutes():
+    decision = interaction.decide_join_opportunity(
+        interaction.JoinOpportunitySignals(
+            trigger_text="这个 bug 到底怎么修",
+            topic_match=True,
+            messages_last_5m=20,
+            bot_messages_last_5m=2,
+            seconds_since_bot_reply=180,
+            human_messages_since_bot=10,
+        )
+    )
+
+    assert decision.action == "silent"
+    assert decision.reason == "bot spoke too much"

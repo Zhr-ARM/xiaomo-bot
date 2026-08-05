@@ -16,7 +16,7 @@ from nonebot.adapters.onebot.v11 import Bot, MessageEvent, GroupMessageEvent, Pr
 
 from . import state
 from .config import get_config
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
 from .database import (
     Nickname,
@@ -62,6 +62,16 @@ from .weather import query_weather
 from .web_search import run_smart_search_result
 
 logger = logging.getLogger("xiaomo.handlers")
+
+
+def _trace_proactive(event: str, group_id: str, **details) -> None:
+    """Write compact proactive diagnostics to the redirected runtime log."""
+    fields = []
+    for key, value in details.items():
+        clean = str(value).replace("\r", " ").replace("\n", " ")[:160]
+        fields.append(f"{key}={clean}")
+    suffix = f" {' '.join(fields)}" if fields else ""
+    print(f"[PROACTIVE] event={event} group={group_id}{suffix}", flush=True)
 
 PROFILE_TOPIC_KEYWORDS = (
     ("python", "Python"),
@@ -412,7 +422,8 @@ def _format_join_instruction(decision_payload: dict) -> str:
         f"max_chars: {max_chars}\n"
         f"{action_hint}\n"
         "Reply like a restrained group member: no lecture, no greeting, no self-introduction, no forced joke.\n"
-        "If the group topic moved on or a human already answered, keep it very short or stay silent.\n"
+        "First decide whether joining still fits the recent group flow. If it does not, output exactly [SILENT] and nothing else.\n"
+        "If a human already answered but a short addition still fits, keep it very short.\n"
         "[/PROACTIVE_JOIN]"
     )
 
@@ -439,6 +450,11 @@ def _reply_budget_for_message(default_max: int, frame_max: int, current_msg: dic
     if join_max > 0:
         budget = min(budget, join_max)
     return budget
+
+
+def _is_silent_join_reply(reply: str) -> bool:
+    normalized = (reply or "").strip().strip("`").strip().upper()
+    return normalized in {"[SILENT]", "SILENT", "[不回复]", "不回复"}
 
 
 def _choose_local_light_reaction(text: str, chooser=random.choice) -> str | None:
@@ -566,6 +582,7 @@ async def _wait_for_natural_send_timing(
             "Proactive reply cancelled before send: group=%s reason=%s",
             group_id, reason,
         )
+        _trace_proactive("cancelled_before_send", group_id, reason=reason)
     return ok
 
 
@@ -931,6 +948,7 @@ async def _process_messages_inner(
         user_profile=llm_profile,
         mode=mode,
         explicit_trigger=explicit_trigger,
+        proactive=bool(join_instruction),
     )
     if mode != "normal" and not strategy.should_reply:
         strategy = fallback_strategy(
@@ -944,6 +962,13 @@ async def _process_messages_inner(
             "Humanize strategy skipped reply: group=%s user=%s reason=%s",
             group_id, user_qq, strategy.reason,
         )
+        if join_instruction:
+            _trace_proactive(
+                "declined_by_strategy",
+                group_id,
+                action=current_msg.get("join_action", ""),
+                reason=strategy.reason,
+            )
         return
 
     # ── 工具调用：天气和联网搜索并发执行，避免串行等待拖慢回复 ──
@@ -1027,6 +1052,17 @@ async def _process_messages_inner(
                         structured_history=structured_history,
                         group_id=group_id,
                     )
+                    if join_instruction and _is_silent_join_reply(reply):
+                        logger.info(
+                            "Proactive join declined by generation AI: group=%s action=%s",
+                            group_id, current_msg.get("join_action", ""),
+                        )
+                        _trace_proactive(
+                            "declined_by_generation",
+                            group_id,
+                            action=current_msg.get("join_action", ""),
+                        )
+                        return
                     reply = post_check_reply(
                         reply,
                         frame=frame,
@@ -1055,10 +1091,24 @@ async def _process_messages_inner(
                             update_group_mood(group_id, mood_result[0], mood_result[1])
                 except Exception as e:
                     logger.exception("LLM call failed")
+                    if join_instruction:
+                        logger.info(
+                            "Proactive join abandoned after LLM failure: group=%s",
+                            group_id,
+                        )
+                        _trace_proactive("llm_failure", group_id)
+                        return
                     reply = "喵呜...小源的脑子好像卡住了 (´;ω;`) 等下再试试好嘛？"
                     print(f"[LLM] Exception: {e}")
     except TimeoutError:
-        logger.warning("LLM lock timeout for group %s, sending fallback", group_id)
+        logger.warning("LLM lock timeout for group %s", group_id)
+        if join_instruction:
+            logger.info(
+                "Proactive join abandoned after LLM timeout: group=%s",
+                group_id,
+            )
+            _trace_proactive("llm_timeout", group_id)
+            return
         print(f"[LLM] Lock timeout for group={group_id}, sending fallback")
         try:
             await _send_group_reply(
@@ -1083,7 +1133,13 @@ async def _process_messages_inner(
         await _send_group_reply(bot, group_id, reply)
         if join_instruction:
             state.mark_proactive_join_sent(group_id)
-        print(f"[REPLY] Sent successfully")
+            _trace_proactive(
+                "sent",
+                group_id,
+                action=current_msg.get("join_action", ""),
+                chars=len(reply),
+            )
+        print("[REPLY] Sent successfully")
     except Exception as e:
         print(f"[REPLY] Failed to send: {e}")
         import traceback
@@ -1155,7 +1211,6 @@ async def _on_message(event: MessageEvent):
                     user_id=int(target_qq),
                     group_id=int(group_id_str),
                 )
-                state.record_bot_reply(group_id_str)
                 logger.info("Poke (api): user=%s group=%s", target_qq, group_id_str)
             except Exception:
                 try:
@@ -1163,7 +1218,6 @@ async def _on_message(event: MessageEvent):
                         group_id=int(group_id_str),
                         message=f"[CQ:poke,qq={target_qq}]",
                     )
-                    state.record_bot_reply(group_id_str)
                     logger.info("Poke (cq): user=%s group=%s", target_qq, group_id_str)
                 except Exception as e2:
                     logger.warning("Poke failed for %s: %s", target_qq, e2)
@@ -1214,8 +1268,6 @@ async def _on_message(event: MessageEvent):
         at_text = _extract_at_text(event, state.bot_qq_id)
         text_at = _is_text_at_mention(event, state.bot_qq_id)
         to_me = getattr(event, "to_me", False)
-        is_empty = not text or not text.strip()
-
         should_respond = mentions_bot or called_bot or text_at or to_me
 
         # ── 图片缓存：无论是否触发回复，都缓存有效图片 ──
@@ -1347,7 +1399,7 @@ async def _on_message(event: MessageEvent):
                     asyncio.create_task(
                         try_poke_topic(group_id_str, user_qq, topic)
                     )
-        sent_proactive_join = False
+        proactive_join_claimed = False
 
         # 关键词反应 / 弔图语录
         if not should_respond and text:
@@ -1356,7 +1408,18 @@ async def _on_message(event: MessageEvent):
                 now_ts = _time.time()
                 min_cooldown = float(join_cfg.get("min_cooldown_seconds", 600))
                 last_join = state.proactive_join_last_time.get(group_id_str, 0)
-                if now_ts - last_join >= min_cooldown:
+                cooldown_remaining = min_cooldown - (now_ts - last_join)
+                if cooldown_remaining > 0:
+                    logger.info(
+                        "Proactive join skipped: group=%s reason=cooldown remaining=%.1fs",
+                        group_id_str, cooldown_remaining,
+                    )
+                    _trace_proactive(
+                        "cooldown",
+                        group_id_str,
+                        remaining=f"{cooldown_remaining:.1f}s",
+                    )
+                else:
                     group_times = state.trim_recent_times(
                         state.group_message_times, group_id_str, now=now_ts,
                     )
@@ -1382,11 +1445,45 @@ async def _on_message(event: MessageEvent):
                             human_messages_since_bot=human_since_bot,
                         )
                     )
+                    logger.info(
+                        "Proactive join scored: group=%s action=%s score=%s reason=%s humans5m=%s bot5m=%s",
+                        group_id_str,
+                        join_decision.action,
+                        join_decision.score,
+                        join_decision.reason,
+                        len(group_times),
+                        len(bot_times),
+                    )
+                    _trace_proactive(
+                        "scored",
+                        group_id_str,
+                        action=join_decision.action,
+                        score=join_decision.score,
+                        humans5m=len(group_times),
+                        bot5m=len(bot_times),
+                        reason=join_decision.reason,
+                    )
                     if join_decision.action != "silent":
                         probability = _join_probability(
                             join_decision.action, join_cfg, group_id_str,
                         )
-                        if random.random() < probability:
+                        probability_roll = random.random()
+                        if probability_roll >= probability:
+                            logger.info(
+                                "Proactive join skipped: group=%s reason=probability action=%s roll=%.3f threshold=%.3f",
+                                group_id_str,
+                                join_decision.action,
+                                probability_roll,
+                                probability,
+                            )
+                            _trace_proactive(
+                                "probability_skip",
+                                group_id_str,
+                                action=join_decision.action,
+                                roll=f"{probability_roll:.3f}",
+                                threshold=f"{probability:.3f}",
+                            )
+                        else:
                             decision_payload = join_decision.to_payload()
                             recent_context = state.format_recent_group_flow(
                                 group_id_str,
@@ -1406,14 +1503,15 @@ async def _on_message(event: MessageEvent):
                                 local_reply = _choose_local_light_reaction(text)
                                 if local_reply:
                                     candidate = local_reply
-                            if await should_send_proactive_message(
-                                group_id=group_id_str,
-                                reason=_join_reason_for_action(join_decision.action),
-                                candidate_text=candidate,
-                                trigger_text=text,
-                                recent_context=recent_context,
-                            ):
-                                if local_reply:
+                            if local_reply:
+                                local_approved = await should_send_proactive_message(
+                                    group_id=group_id_str,
+                                    reason=_join_reason_for_action(join_decision.action),
+                                    candidate_text=candidate,
+                                    trigger_text=text,
+                                    recent_context=recent_context,
+                                )
+                                if local_approved:
                                     current_local_msg = {
                                         "timestamp": now_ts,
                                         "join_instruction": _format_join_instruction(
@@ -1439,57 +1537,80 @@ async def _on_message(event: MessageEvent):
                                             bot, group_id_str, local_reply,
                                         )
                                         state.mark_proactive_join_sent(group_id_str)
-                                        state.proactive_join_last_time[group_id_str] = now_ts
-                                        sent_proactive_join = True
+                                        proactive_join_claimed = True
                                         logger.info(
                                             "Local proactive reaction sent: group=%s action=%s score=%s",
                                             group_id_str,
                                             join_decision.action,
                                             join_decision.score,
                                         )
+                                        _trace_proactive(
+                                            "local_sent",
+                                            group_id_str,
+                                            action=join_decision.action,
+                                            score=join_decision.score,
+                                        )
                                 else:
-                                    message_id = await store_memory(
-                                        user_qq=user_qq,
-                                        group_id=group_id_str,
-                                        scene="group",
-                                        role="user",
-                                        content=text,
-                                    )
-                                    get_silent_window().enqueue(
-                                        group_key(group_id_str),
-                                        {
-                                            "scene": "group",
-                                            "target_id": user_qq,
-                                            "group_id": group_id_str,
-                                            "user_qq": user_qq,
-                                            "text": text,
-                                            "timestamp": now_ts,
-                                            "mode": "normal",
-                                            "mode_target": "",
-                                            "explicit_trigger": False,
-                                            "search_text": "",
-                                            "weather_query": "",
-                                            "message_id": message_id,
-                                            "join_instruction": _format_join_instruction(
-                                                decision_payload
-                                            ),
-                                            "join_max_chars": join_decision.max_chars,
-                                            "join_action": join_decision.action,
-                                            "ambient_context": recent_context,
-                                        },
-                                        is_group=True,
-                                        wait_seconds=float(join_cfg.get("window_seconds", 1.5)),
-                                    )
-                                    state.proactive_join_last_time[group_id_str] = now_ts
                                     logger.info(
-                                        "Proactive join queued: group=%s action=%s score=%s reason=%s",
-                                        group_id_str,
-                                        join_decision.action,
-                                        join_decision.score,
-                                        join_decision.reason,
+                                        "Local proactive reaction rejected by AI gate: group=%s action=%s",
+                                        group_id_str, join_decision.action,
                                     )
+                                    _trace_proactive(
+                                        "local_ai_rejected",
+                                        group_id_str,
+                                        action=join_decision.action,
+                                    )
+                            else:
+                                # The generation LLM is the single contextual AI gate for
+                                # generated joins and can return the internal [SILENT] marker.
+                                message_id = await store_memory(
+                                    user_qq=user_qq,
+                                    group_id=group_id_str,
+                                    scene="group",
+                                    role="user",
+                                    content=text,
+                                )
+                                get_silent_window().enqueue(
+                                    group_key(group_id_str),
+                                    {
+                                        "scene": "group",
+                                        "target_id": user_qq,
+                                        "group_id": group_id_str,
+                                        "user_qq": user_qq,
+                                        "text": text,
+                                        "timestamp": now_ts,
+                                        "mode": "normal",
+                                        "mode_target": "",
+                                        "explicit_trigger": False,
+                                        "search_text": "",
+                                        "weather_query": "",
+                                        "message_id": message_id,
+                                        "join_instruction": _format_join_instruction(
+                                            decision_payload
+                                        ),
+                                        "join_max_chars": join_decision.max_chars,
+                                        "join_action": join_decision.action,
+                                        "ambient_context": recent_context,
+                                    },
+                                    is_group=True,
+                                    wait_seconds=float(join_cfg.get("window_seconds", 1.5)),
+                                )
+                                proactive_join_claimed = True
+                                logger.info(
+                                    "Proactive join queued for contextual AI gate: group=%s action=%s score=%s reason=%s",
+                                    group_id_str,
+                                    join_decision.action,
+                                    join_decision.score,
+                                    join_decision.reason,
+                                )
+                                _trace_proactive(
+                                    "queued",
+                                    group_id_str,
+                                    action=join_decision.action,
+                                    score=join_decision.score,
+                                )
 
-        if not should_respond and text and not sent_proactive_join:
+        if not should_respond and text and not proactive_join_claimed:
             reaction = check_reaction(text, group_id_str)
             if reaction:
                 if await should_send_proactive_message(

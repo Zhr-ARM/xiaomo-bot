@@ -9,6 +9,18 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 New-Item -ItemType Directory -Force -Path (Join-Path $scriptDir "data") | Out-Null
 
+# Keep autostart and manual launches from creating competing supervisors.
+$supervisorCreated = $false
+$supervisorMutex = New-Object System.Threading.Mutex(
+    $true,
+    "Local\XiaomoBotSupervisor",
+    [ref]$supervisorCreated
+)
+if (-not $supervisorCreated) {
+    Write-Host "[Skip] Xiaomo bot supervisor is already running"
+    exit 0
+}
+
 Write-Host "============================================"
 Write-Host "  Xiaoyuan QQ Bot"
 Write-Host "============================================"
@@ -110,33 +122,69 @@ if (-not (Test-Path "data\persona.md")) {
 }
 
 # === Start bot (Python) first, in background ===
-Write-Host "[Start] Launching bot (NoneBot2)..."
-$botProc = Start-Process -FilePath $pythonCmd -ArgumentList "-u", "bot.py" -WorkingDirectory $scriptDir -PassThru -NoNewWindow -RedirectStandardOutput "$scriptDir\data\_bot_stdout.log" -RedirectStandardError "$scriptDir\data\_bot_stderr.log"
-Write-Host "[Start] Bot PID: $($botProc.Id), waiting for port 8080..."
+$botStdout = Join-Path $scriptDir "data\_bot_stdout.log"
+$botStderr = Join-Path $scriptDir "data\_bot_stderr.log"
+$botLogArchive = Join-Path $scriptDir "data\startup_history"
+New-Item -ItemType Directory -Force -Path $botLogArchive | Out-Null
 
-# Wait for NoneBot2 to be ready
-$ready = $false
-for ($i = 0; $i -lt 60; $i++) {
-    Start-Sleep -Seconds 2
-    $portCheck = netstat -ano | Select-String ":8080 .*LISTENING"
-    if ($portCheck) {
-        $ready = $true
-        Write-Host "[Start] Bot is ready (port 8080 listening)"
-        break
+function Archive-BotLogs {
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    foreach ($entry in @(
+        @{ Path = $botStdout; Name = "bot_stdout" },
+        @{ Path = $botStderr; Name = "bot_stderr" }
+    )) {
+        if (Test-Path $entry.Path) {
+            $item = Get-Item -LiteralPath $entry.Path -ErrorAction SilentlyContinue
+            if ($item -and $item.Length -gt 0) {
+                Copy-Item -LiteralPath $entry.Path -Destination (Join-Path $botLogArchive "$($entry.Name)-$stamp.log") -Force
+            }
+        }
     }
-    if ($botProc.HasExited) {
-        Write-Host "[Error] Bot process exited unexpectedly" -ForegroundColor Red
-        Write-Host "--- stderr tail ---"
-        Get-Content "$scriptDir\data\_bot_stderr.log" -Tail 20 -ErrorAction SilentlyContinue
-        exit 1
-    }
-    Write-Host "." -NoNewline
 }
-if (-not $ready) {
+
+function Start-BotProcess {
+    Archive-BotLogs
+    Write-Host "[Start] Launching bot (NoneBot2)..."
+    $proc = Start-Process -FilePath $pythonCmd -ArgumentList "-u", "bot.py" -WorkingDirectory $scriptDir -PassThru -NoNewWindow -RedirectStandardOutput $botStdout -RedirectStandardError $botStderr
+    Write-Host "[Start] Bot PID: $($proc.Id), waiting for port 8080..."
+    return $proc
+}
+
+function Wait-BotReady($proc) {
+    for ($i = 0; $i -lt 60; $i++) {
+        Start-Sleep -Seconds 2
+        $portCheck = netstat -ano | Select-String ":8080 .*LISTENING"
+        if ($portCheck) {
+            Write-Host "[Start] Bot is ready (port 8080 listening)"
+            return $true
+        }
+        if ($proc.HasExited) {
+            Write-Host "[Error] Bot process exited unexpectedly (code $($proc.ExitCode))" -ForegroundColor Red
+            $stderrTail = Get-Content $botStderr -Tail 30 -ErrorAction SilentlyContinue
+            foreach ($line in $stderrTail) {
+                Write-Host $line
+            }
+            return $false
+        }
+        Write-Host "." -NoNewline
+    }
+
     Write-Host ""
     Write-Host "[Error] Bot failed to start within 2 minutes" -ForegroundColor Red
-    Stop-Process -Id $botProc.Id -Force -ErrorAction SilentlyContinue
-    exit 1
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    return $false
+}
+
+$restartDelaySeconds = 5
+$botProc = $null
+while ($true) {
+    $botProc = Start-BotProcess
+    if (Wait-BotReady $botProc) {
+        break
+    }
+    Write-Host "[Restart] Retrying bot startup in $restartDelaySeconds seconds..." -ForegroundColor Yellow
+    Start-Sleep -Seconds $restartDelaySeconds
+    $restartDelaySeconds = [Math]::Min(60, $restartDelaySeconds * 2)
 }
 
 # === Start LLBot ===
@@ -172,12 +220,7 @@ if ($SkipLLBot) {
     if (Test-Path "$scriptDir\llbot.default_config.json") {
         Copy-Item "$scriptDir\llbot.default_config.json" "$llbotDir\bin\llbot\default_config.json" -Force
     }
-    # Remove old per-QQ config so it regenerates with ws-reverse enabled
-    $oldConfigs = Get-ChildItem "$llbotDir\bin\llbot\data\config_*.json" -ErrorAction SilentlyContinue
-    if ($oldConfigs) {
-        Write-Host "[LLBot] Updating QQ config..."
-        Remove-Item "$llbotDir\bin\llbot\data\config_*.json" -Force -ErrorAction SilentlyContinue
-    }
+    # Keep the generated per-account config; it contains the working login and ws-reverse settings.
     Write-Host "[LLBot] Starting..."
     Start-Process -FilePath $llbotExe -WorkingDirectory $llbotDir
     Write-Host "[LLBot] Waiting for injection and login (15s)..."
@@ -197,16 +240,35 @@ Write-Host "============================================"
 Write-Host ""
 Write-Host "Press Ctrl+C to stop all services"
 
-# Monitor bot process and restart if it crashes
-while (-not $botProc.HasExited) {
-    Start-Sleep -Seconds 5
+# Monitor bot process and restart it after unexpected exits.
+$restartDelaySeconds = 5
+$lastLLBotRestart = 0
+while ($true) {
+    while (-not $botProc.HasExited) {
+        Start-Sleep -Seconds 5
+        if ((-not $SkipLLBot) -and $llbotExe) {
+            $llbotAlive = [bool](Get-CimInstance Win32_Process | Where-Object {
+                $_.Name -eq "llbot.exe" -and $_.CommandLine -like "*$llbotDir*"
+            })
+            $nowSeconds = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+            if ((-not $llbotAlive) -and ($nowSeconds - $lastLLBotRestart -ge 30)) {
+                Write-Host "[LLBot] Process missing, restarting..." -ForegroundColor Yellow
+                Start-Process -FilePath $llbotExe -WorkingDirectory $llbotDir
+                $lastLLBotRestart = $nowSeconds
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Host "[Error] Bot process exited with code $($botProc.ExitCode)" -ForegroundColor Red
+    Get-Content $botStderr -Tail 30 -ErrorAction SilentlyContinue
+    Write-Host "[Restart] Restarting bot in $restartDelaySeconds seconds..." -ForegroundColor Yellow
+    Start-Sleep -Seconds $restartDelaySeconds
+
+    $botProc = Start-BotProcess
+    if (Wait-BotReady $botProc) {
+        $restartDelaySeconds = 5
+    } else {
+        $restartDelaySeconds = [Math]::Min(60, $restartDelaySeconds * 2)
+    }
 }
-Write-Host ""
-Write-Host "[Error] Bot process exited with code $($botProc.ExitCode)" -ForegroundColor Red
-Get-Content "$scriptDir\data\_bot_stderr.log" -Tail 30 -ErrorAction SilentlyContinue
-Write-Host ""
-Write-Host "Common causes:"
-Write-Host "  1. Port 8080 in use - close other programs"
-Write-Host "  2. API key not set or invalid in .env"
-Write-Host "  3. Missing dependencies - run: pip install -e ."
-exit $botProc.ExitCode

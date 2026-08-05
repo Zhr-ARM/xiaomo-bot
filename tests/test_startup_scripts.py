@@ -54,3 +54,22 @@ def test_windows_start_script_does_not_globally_kill_node_or_llbot():
     assert "function Test-ProjectProcess" in text
     assert "Port 8080 is used by another process" in text
     assert "Read-Host" not in text
+
+
+def test_windows_start_script_restarts_and_archives_bot_logs():
+    text = read_text("start_bot.ps1")
+
+    assert "function Start-BotProcess" in text
+    assert "function Wait-BotReady" in text
+    assert "data\\startup_history" in text
+    assert "[Restart] Restarting bot" in text
+    assert "Local\\XiaomoBotSupervisor" in text
+    assert "[LLBot] Process missing, restarting" in text
+    assert 'Remove-Item "$llbotDir\\bin\\llbot\\data\\config_*.json"' not in text
+
+
+def test_plugin_starts_vector_store_in_background():
+    text = read_text("src/plugins/xiaomo/__init__.py")
+
+    assert "start_vector_store_init()" in text
+    assert "await init_vector_store()" not in text

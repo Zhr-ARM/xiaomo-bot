@@ -167,6 +167,7 @@ def mark_proactive_join_sent(group_id: str, *, now: float | None = None) -> None
     """Start a feedback window after an ambient proactive reply is sent."""
     if now is None:
         now = time.time()
+    proactive_join_last_time[group_id] = now
     data = proactive_join_feedback.setdefault(group_id, {"score": 0.0})
     data["pending"] = {
         "sent_at": now,

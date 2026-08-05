@@ -54,6 +54,7 @@ EMOTION_CUES = (
 OPINION_CUES = (
     "\u6211\u89c9\u5f97", "\u611f\u89c9", "\u6709\u70b9", "\u5176\u5b9e",
     "\u8bf4\u5b9e\u8bdd", "\u600e\u4e48\u770b", "\u9510\u8bc4", "\u8bc4\u4ef7",
+    "\u5c45\u7136", "\u7adf\u7136", "\u6ca1\u60f3\u5230", "\u771f\u5c31",
 )
 
 SOCIAL_CUES = (
@@ -127,11 +128,11 @@ def _action_for_score(score: int) -> str:
 
 
 def _join_action_for_score(score: int) -> tuple[str, int]:
-    if score < 32:
+    if score < 30:
         return "silent", 0
-    if score < 46:
+    if score < 48:
         return "react", 80
-    if score < 64:
+    if score < 68:
         return "short_reply", 160
     return "helpful_reply", 360
 
@@ -207,7 +208,8 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         return JoinOpportunityDecision(0, "silent", "empty", 0)
     if signals.quiet_hours:
         return JoinOpportunityDecision(0, "silent", "quiet hours", 0)
-    if signals.bot_messages_last_5m >= 2 and signals.seconds_since_bot_reply < 90:
+    # A hard rolling cap keeps higher participation from turning into flooding.
+    if signals.bot_messages_last_5m >= 2:
         return JoinOpportunityDecision(0, "silent", "bot spoke too much", 0)
     if (
         signals.messages_last_5m >= 18
@@ -217,7 +219,7 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         return JoinOpportunityDecision(0, "silent", "busy group and recent bot reply", 0)
 
     reasons: list[str] = []
-    score = 34
+    score = 38
 
     if _has_help_intent(text):
         score += 34
@@ -253,13 +255,13 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         reasons.append("familiar user")
 
     if signals.messages_last_5m >= 18:
-        score -= 26
+        score -= 16
         reasons.append("very busy group")
     elif signals.messages_last_5m >= 10:
-        score -= 14
+        score -= 8
         reasons.append("busy group")
     elif signals.messages_last_5m <= 3:
-        score += 10
+        score += 6
         reasons.append("room to speak")
 
     if signals.bot_messages_last_5m >= 2:

@@ -85,6 +85,16 @@ def test_join_reply_budget_ignores_invalid_action_budget():
     assert budget == 180
 
 
+def test_join_instruction_combines_ai_decision_with_reply_generation():
+    instruction = handlers._format_join_instruction(
+        {"action": "short_reply", "score": 58, "reason": "opinion", "max_chars": 160}
+    )
+
+    assert "output exactly [SILENT]" in instruction
+    assert handlers._is_silent_join_reply("[SILENT]") is True
+    assert handlers._is_silent_join_reply("这课确实教得有点脱节") is False
+
+
 def test_local_light_reaction_handles_small_banter():
     reply = handlers._choose_local_light_reaction(
         "哈哈哈哈这也太离谱了",

@@ -199,10 +199,19 @@ def build_strategy_prompt(
     context: str,
     user_profile: dict | None,
     mode: str,
+    proactive: bool = False,
 ) -> str:
     profile_total = 0
     if user_profile and user_profile.get("exists"):
         profile_total = int(user_profile.get("total_messages") or 0)
+    proactive_rules = ""
+    if proactive:
+        proactive_rules = (
+            "\n这是一次未被 @ 的主动接话候选。没有 @ 本身不是拒绝理由。\n"
+            "- 问题、求助、情绪、观点、明显的聊天空位，默认 should_reply=true。\n"
+            "- 如果话题已经被别人接住、只是两个人的私密对话、内容无法接续，或小源出现会打断节奏，才 should_reply=false。\n"
+            "- 适合参与时优先 brief/playful/ask_back，除非确实是技术求助。\n"
+        )
     return (
         "你是小源的回复策略决策器，不负责正式回复，只判断这一轮群聊该怎么回。\n"
         "只输出 JSON，不要输出解释。格式：\n"
@@ -214,6 +223,7 @@ def build_strategy_prompt(
         "- 如果只是顺嘴提到小源、没有明确问她，should_reply=false。\n"
         "- 技术求助才 serious；闲聊优先 brief/playful；不清楚就 ask_back。\n"
         "- instruction 要具体，提醒正式回复自然、短、承认不确定、必要时反问。\n\n"
+        f"{proactive_rules}"
         f"群号：{group_id}\n"
         f"模式：{mode}\n"
         f"该成员历史互动数：{profile_total}\n"
@@ -231,6 +241,7 @@ async def decide_reply_strategy(
     user_profile: dict | None,
     mode: str = "normal",
     explicit_trigger: bool = False,
+    proactive: bool = False,
 ) -> ReplyStrategy:
     fallback = fallback_strategy(
         raw_text=raw_text,
@@ -248,6 +259,14 @@ async def decide_reply_strategy(
         )
         return fallback
 
+    if proactive:
+        fallback.delay_seconds = min(
+            fallback.delay_seconds,
+            float(cfg.get("proactive_fallback_max_delay_seconds", 0.2)),
+        )
+        if cfg.get("strategy_llm_for_proactive", False) is False:
+            return fallback
+
     timeout_seconds = float(cfg.get("strategy_timeout_seconds", 12))
     max_delay = float(cfg.get("max_extra_delay_seconds", 5))
     prompt = build_strategy_prompt(
@@ -256,6 +275,7 @@ async def decide_reply_strategy(
         context=context,
         user_profile=user_profile,
         mode=mode,
+        proactive=proactive,
     )
     try:
         async with asyncio.timeout(timeout_seconds):
@@ -268,7 +288,13 @@ async def decide_reply_strategy(
                 structured_history=None,
                 group_id=group_id,
             )
-        return parse_strategy_reply(reply, fallback=fallback, max_delay=max_delay)
+        strategy = parse_strategy_reply(reply, fallback=fallback, max_delay=max_delay)
+        if proactive:
+            strategy.delay_seconds = min(
+                strategy.delay_seconds,
+                float(cfg.get("proactive_strategy_max_delay_seconds", 0.4)),
+            )
+        return strategy
     except Exception:
         logger.exception("Reply strategy decision failed, using fallback")
         return fallback

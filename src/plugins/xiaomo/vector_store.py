@@ -1,7 +1,9 @@
 """小源 QQ 机器人 - 向量记忆存储 (ChromaDB + sentence-transformers)"""
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from pathlib import Path
 
 from .config import get_config
@@ -10,6 +12,7 @@ logger = logging.getLogger("xiaomo.vector_store")
 
 _collection = None
 _embedding_model = None
+_init_task: asyncio.Task | None = None
 
 
 def _get_data_dir() -> Path:
@@ -18,11 +21,8 @@ def _get_data_dir() -> Path:
     return Path(db_path).parent
 
 
-async def init_vector_store():
-    global _collection, _embedding_model
-
-    import os
-
+def _load_vector_store_sync():
+    """Load the local embedding stack without blocking NoneBot's event loop."""
     # 国内 HuggingFace 镜像，加速模型下载
     if "HF_ENDPOINT" not in os.environ:
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -35,7 +35,7 @@ async def init_vector_store():
 
     # 向量存储
     client = chromadb.PersistentClient(path=str(data_dir / "vector_db"))
-    _collection = client.get_or_create_collection(
+    collection = client.get_or_create_collection(
         name="chat_memory",
         metadata={"hnsw:space": "cosine"},
     )
@@ -43,8 +43,41 @@ async def init_vector_store():
     # 本地 embedding 模型
     model_name = get_config().get("vector", {}).get("model", "BAAI/bge-small-zh-v1.5")
     logger.info("Loading embedding model: %s", model_name)
-    _embedding_model = SentenceTransformer(model_name)
+    embedding_model = SentenceTransformer(model_name)
+    return collection, embedding_model
+
+
+async def init_vector_store() -> bool:
+    """Initialize semantic memory in a worker thread and degrade gracefully."""
+    global _collection, _embedding_model
+
+    if _collection is not None and _embedding_model is not None:
+        return True
+
+    try:
+        collection, embedding_model = await asyncio.to_thread(_load_vector_store_sync)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Vector store initialization failed; semantic recall is disabled")
+        return False
+
+    _collection = collection
+    _embedding_model = embedding_model
     logger.info("Vector store initialized (collection: %d docs)", _collection.count())
+    return True
+
+
+def start_vector_store_init() -> asyncio.Task:
+    """Start semantic-memory initialization without delaying bot readiness."""
+    global _init_task
+    if _init_task is None or _init_task.done():
+        _init_task = asyncio.create_task(
+            init_vector_store(),
+            name="xiaomo-vector-store-init",
+        )
+        logger.info("Vector store initialization scheduled in background")
+    return _init_task
 
 
 def _embed(texts: list[str]) -> list[list[float]]:
@@ -145,6 +178,13 @@ async def delete_messages(message_ids: list[int] | tuple[int, ...] | set[int]):
 
 
 async def close_vector_store():
-    global _collection, _embedding_model
+    global _collection, _embedding_model, _init_task
+    if _init_task is not None and not _init_task.done():
+        _init_task.cancel()
+        try:
+            await _init_task
+        except asyncio.CancelledError:
+            pass
+    _init_task = None
     _collection = None
     _embedding_model = None

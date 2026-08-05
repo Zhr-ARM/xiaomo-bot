@@ -198,6 +198,12 @@ async def should_send_proactive_message(
         timeout_seconds = float(proactive_cfg.get("ai_gate_timeout_seconds", 20))
         async with asyncio.timeout(timeout_seconds):
             return bool(await ai_decider(payload))
+    except TimeoutError:
+        logger.warning(
+            "Proactive AI decision timed out: group=%s reason=%s",
+            group_id, reason,
+        )
+        return False
     except Exception:
         logger.exception("Proactive AI decision failed: group=%s reason=%s", group_id, reason)
         return False
@@ -404,15 +410,20 @@ async def try_poke_topic(
     if random.random() > probability:
         return False
 
-    # 发送戳一戳（纯 poke，无附带文字）
-    # OneBot v11 标准无 send_poke API，用 CQ 码发
+    # LLBot supports send_poke; retain a CQ fallback for other OneBot bridges.
     try:
         bot = get_bot()
-        poke_msg = f"[CQ:poke,qq={user_qq}]"
-        await bot.send_group_msg(
-            group_id=int(group_id), message=poke_msg,
-        )
-        state.record_bot_reply(group_id)
+        try:
+            await bot.call_api(
+                "send_poke",
+                user_id=int(user_qq),
+                group_id=int(group_id),
+            )
+        except Exception:
+            await bot.send_group_msg(
+                group_id=int(group_id),
+                message=f"[CQ:poke,qq={user_qq}]",
+            )
         state.poke_group_last_time[group_id] = now
         state.poke_user_last_time[key] = now
         logger.info(

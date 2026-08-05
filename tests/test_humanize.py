@@ -172,3 +172,34 @@ async def test_explicit_mention_caps_local_thinking_delay(monkeypatch):
     )
 
     assert strategy.delay_seconds <= 0.25
+
+
+@pytest.mark.asyncio
+async def test_proactive_strategy_uses_fast_local_shape_before_generation_ai(monkeypatch):
+    monkeypatch.setattr(
+        humanize,
+        "get_config",
+        lambda: {
+            "humanize": {
+                "enabled": True,
+                "strategy_llm_for_proactive": False,
+                "proactive_fallback_max_delay_seconds": 0.15,
+            }
+        },
+    )
+
+    class FailIfCalled:
+        async def chat(self, **kwargs):
+            raise AssertionError("proactive strategy must not add a second LLM call")
+
+    strategy = await humanize.decide_reply_strategy(
+        llm=FailIfCalled(),
+        group_id="g1",
+        raw_text="我们专业机械制图居然不教 CAD",
+        context="群里正在聊课程安排",
+        user_profile={"exists": True, "total_messages": 5},
+        proactive=True,
+    )
+
+    assert strategy.should_reply is True
+    assert strategy.delay_seconds <= 0.15

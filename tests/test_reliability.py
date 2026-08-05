@@ -223,6 +223,42 @@ async def test_default_proactive_ai_decider_parses_json(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_topic_poke_prefers_llbot_api_without_counting_as_text_reply(monkeypatch):
+    from src.plugins.xiaomo import state
+
+    class FakeBot:
+        def __init__(self):
+            self.calls = []
+
+        async def call_api(self, action, **params):
+            self.calls.append((action, params))
+
+        async def send_group_msg(self, **kwargs):
+            raise AssertionError("CQ fallback should not run when send_poke succeeds")
+
+    bot = FakeBot()
+    state.poke_group_last_time.clear()
+    state.poke_user_last_time.clear()
+    state.bot_reply_times.clear()
+    monkeypatch.setattr(auto_action, "get_bot", lambda: bot)
+
+    sent = await auto_action.try_poke_topic(
+        "123",
+        "10001",
+        "AI",
+        probability=1.0,
+        user_cooldown_hours=0,
+        group_cooldown_seconds=0,
+    )
+
+    assert sent is True
+    assert bot.calls == [
+        ("send_poke", {"user_id": 10001, "group_id": 123})
+    ]
+    assert state.bot_reply_times.get("123") is None
+
+
+@pytest.mark.asyncio
 async def test_database_init_and_close_are_idempotent(monkeypatch, tmp_path):
     await database.close_database()
     db_path = tmp_path / "xiaomo-test.db"
