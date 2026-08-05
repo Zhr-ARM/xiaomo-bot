@@ -19,6 +19,12 @@ def test_linux_start_script_supports_bot_and_bridge_modes():
     assert "python3" in text
     assert "bot.py" in text
     assert "ws://127.0.0.1:${PORT}/onebot/v11/ws" in text
+    assert 'http_ok "/healthz"' in text
+    assert 'http_ok "/readyz"' in text
+    assert "trap cleanup EXIT INT TERM" in text
+    assert 'done < <(pgrep -f "$LLBOT_EXE" || true)' in text
+    assert "sleep 10" in text
+    assert "xiaomo_bot.egg-info" not in text
 
 
 def test_linux_autostart_installer_uses_systemd_user_service():
@@ -28,6 +34,8 @@ def test_linux_autostart_installer_uses_systemd_user_service():
     assert "xiaomo-bot.service" in text
     assert 'ExecStart=/usr/bin/env bash "$ROOT_DIR/start_bot.sh"' in text
     assert "loginctl enable-linger" in text
+    assert 'START_ARGS=""' in text
+    assert "KillMode=control-group" in text
 
 
 def test_windows_autostart_uses_quoted_absolute_vbs_target():
@@ -52,7 +60,9 @@ def test_windows_start_script_does_not_globally_kill_node_or_llbot():
 
     assert 'Get-Process -Name "llbot", "node", "pmhq"' not in text
     assert "function Test-ProjectProcess" in text
-    assert "Port 8080 is used by another process" in text
+    assert "Port $botPort is used by another process" in text
+    assert "$healthUrl" in text
+    assert "$readyUrl" in text
     assert "Read-Host" not in text
 
 
@@ -66,6 +76,10 @@ def test_windows_start_script_restarts_and_archives_bot_logs():
     assert "Local\\XiaomoBotSupervisor" in text
     assert "[LLBot] Process missing, restarting" in text
     assert 'Remove-Item "$llbotDir\\bin\\llbot\\data\\config_*.json"' not in text
+    assert "xiaomo_bot.egg-info" not in text
+    assert "QQ bridge is disconnected" in text
+    assert "New-Item -ItemType Directory -Path $destinationDir" in text
+    assert "Start-Sleep -Seconds 10" in text
 
 
 def test_plugin_starts_vector_store_in_background():

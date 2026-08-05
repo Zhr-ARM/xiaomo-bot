@@ -3,7 +3,7 @@
 农历数据基于 zhdate 库，宜忌基于建除十二神推算。
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zhdate import ZhDate
 
 # ── 天干地支 ──────────────────────────────────────────────────

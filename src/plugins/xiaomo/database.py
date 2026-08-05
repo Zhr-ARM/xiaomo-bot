@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import math
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -15,9 +14,13 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
+    event,
+    update,
     select,
     desc,
 )
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -49,6 +52,14 @@ async def init_database():
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
     _engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+
+    @event.listens_for(_engine.sync_engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
     async with _engine.begin() as conn:
@@ -89,8 +100,8 @@ class User(Base):
     profile_data: Mapped[Optional[str]] = mapped_column(Text, default="{}")
 
     # Relationships
-    nicknames = relationship("UserNickname", back_populates="user", lazy="selectin")
-    messages = relationship("Message", back_populates="user", lazy="selectin")
+    nicknames = relationship("UserNickname", back_populates="user", lazy="noload")
+    messages = relationship("Message", back_populates="user", lazy="noload")
 
     def get_profile(self) -> dict:
         return json.loads(self.profile_data or "{}")
@@ -197,6 +208,46 @@ class ContextSummary(Base):
     )
 
 
+class InboundEvent(Base):
+    """Map a OneBot group event to its stored message.
+
+    Keeping transport IDs separate avoids changing the existing messages table and
+    gives us both replay deduplication and reliable reply-target lookup.
+    """
+
+    __tablename__ = "inbound_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_message_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    user_qq: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id",
+            "source_message_id",
+            name="uq_inbound_group_source",
+        ),
+        Index("idx_inbound_message", "message_id"),
+    )
+
+
+class RuntimeState(Base):
+    """Small durable snapshots for cooldowns and participation feedback."""
+
+    __tablename__ = "runtime_state"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, default=time.time)
+
+
 # ─── Repository Helpers ──────────────────────────────────────────────────────
 
 
@@ -239,6 +290,133 @@ async def save_message(
 
     await session.flush()
     return msg
+
+
+async def save_inbound_group_message(
+    session: AsyncSession,
+    *,
+    group_id: str,
+    source_message_id: str,
+    user_qq: str,
+    content: str,
+    nickname: str | None = None,
+    image_url: str | None = None,
+    image_description: str | None = None,
+) -> tuple[Message | None, bool, User | None]:
+    """Store one incoming group event exactly once.
+
+    The reservation insert and message write share a transaction. A replay sees
+    the unique transport key and reuses the original message instead of replying
+    twice or inflating user statistics.
+    """
+
+    insert_result = await session.execute(
+        sqlite_insert(InboundEvent)
+        .values(
+            group_id=group_id,
+            source_message_id=source_message_id,
+            user_qq=user_qq,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["group_id", "source_message_id"]
+        )
+    )
+    if insert_result.rowcount == 0:
+        existing_result = await session.execute(
+            select(Message)
+            .join(InboundEvent, InboundEvent.message_id == Message.id)
+            .where(
+                InboundEvent.group_id == group_id,
+                InboundEvent.source_message_id == source_message_id,
+            )
+        )
+        return existing_result.scalar_one_or_none(), False, None
+
+    user = await get_or_create_user(session, user_qq)
+    if nickname and user.nickname != nickname:
+        user.nickname = nickname
+    user.total_messages = (user.total_messages or 0) + 1
+    user.last_seen = time.time()
+
+    message = Message(
+        user_qq=user_qq,
+        group_id=group_id,
+        scene="group",
+        role="user",
+        content=content,
+        image_url=image_url,
+        image_description=image_description,
+    )
+    session.add(message)
+    await session.flush()
+    await session.execute(
+        update(InboundEvent)
+        .where(
+            InboundEvent.group_id == group_id,
+            InboundEvent.source_message_id == source_message_id,
+        )
+        .values(message_id=message.id)
+    )
+    return message, True, user
+
+
+async def get_message_by_source_id(
+    session: AsyncSession,
+    *,
+    group_id: str,
+    source_message_id: str,
+) -> Message | None:
+    result = await session.execute(
+        select(Message)
+        .join(InboundEvent, InboundEvent.message_id == Message.id)
+        .where(
+            InboundEvent.group_id == group_id,
+            InboundEvent.source_message_id == source_message_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def link_source_message_id(
+    session: AsyncSession,
+    *,
+    group_id: str,
+    source_message_id: str,
+    message_id: int,
+    user_qq: str | None = None,
+) -> None:
+    await session.execute(
+        sqlite_insert(InboundEvent)
+        .values(
+            group_id=group_id,
+            source_message_id=source_message_id,
+            message_id=message_id,
+            user_qq=user_qq,
+        )
+        .on_conflict_do_update(
+            index_elements=["group_id", "source_message_id"],
+            set_={"message_id": message_id, "user_qq": user_qq},
+        )
+    )
+
+
+async def update_message_content(
+    session: AsyncSession,
+    message_id: int,
+    *,
+    content: str,
+    image_url: str | None = None,
+    image_description: str | None = None,
+) -> None:
+    await session.execute(
+        update(Message)
+        .where(Message.id == message_id)
+        .values(
+            content=content,
+            image_url=image_url,
+            image_description=image_description,
+        )
+    )
 
 
 async def get_context_messages(

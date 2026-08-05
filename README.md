@@ -8,7 +8,7 @@
 - **记忆系统** — SQLite 消息存储 + 权重衰减 + 自动摘要压缩
 - **语义搜索** — ChromaDB 向量存储，检索历史相关讨论（BGE 中文嵌入模型）
 - **用户画像** — 自动记录群成员发言习惯和技术方向
-- **天气查询** — 支持"冷不冷"等自然语言查询 + 每日定时推送（wttr.in）
+- **天气查询** — 自动识别提问中的城市，支持自然语言查询和每日定时推送
 - **静默窗口** — 聚合连续消息再回复，模拟真人聊天节奏
 - **特殊模式** — 夸夸、点草（友好吐槽）、嵌入式冷笑话
 - **视觉识别** — 支持图片描述（需配置 Vision API）
@@ -21,7 +21,7 @@
 | 依赖 | 说明 |
 |------|------|
 | Windows 10+ / Linux | Windows 可直接拉起 LLBot；Linux 可运行 bot 并连接 LLBot/NapCat 等 OneBot 桥接 |
-| Python 3.10+ | 机器人运行环境 |
+| Python 3.11+ | 机器人运行环境 |
 | QQ 账号 | 机器人的 QQ 号（建议用小号） |
 | MiMo-V2.5 API Key | LLM 对话 + 图片识别（api.xiaomimimo.com） |
 | Tavily API Key | 可选；用于联网搜索，不配置则跳过搜索 |
@@ -62,9 +62,9 @@ cd xiaomo-bot
 start_bot.bat
 ```
 
-首次运行会自动：安装 Python 依赖 → 创建 `.env` 模板 → 初始化人设 → 启动 LLBot → 启动机器人。
+启动脚本会按 `constraints.txt` 同步依赖、创建缺失的 `.env` 和人设文件，再启动机器人与 LLBot。残留的 `egg-info` 不会让依赖更新被跳过。
 
-> 如果提示缺少 Python，请先安装 [Python 3.10+](https://www.python.org/downloads/)。
+> 如果提示缺少 Python，请先安装 [Python 3.11+](https://www.python.org/downloads/)。
 
 ### 4. 配置
 
@@ -106,6 +106,8 @@ chmod +x start_bot.sh scripts/install_linux_autostart.sh
 ```bash
 ./start_bot.sh --no-llbot
 ```
+
+`start_bot.sh` 会同时监控 Python 服务和本机 LLBot。进程存活但 QQ WebSocket 长时间断开时会重启 LLBot；退出服务时会清理由脚本启动的子进程。
 
 安装 Linux systemd 用户自启动：
 
@@ -270,7 +272,9 @@ poke_everyone_cooldown_minutes: 0
 # 自动行为
 auto_action:
   bubble_inactive_minutes: 30    # 多少分钟无消息触发冒泡
+  bubble_max_inactive_minutes: 180 # 沉寂太久后不再凭空冒泡
   bubble_cooldown_minutes: 60    # 冒泡冷却
+  bubble_attempt_cooldown_minutes: 15 # AI 拒绝后多久再尝试
   repeat_threshold: 3            # 复读触发阈值
   repeat_cooldown_minutes: 30    # 复读冷却
 
@@ -300,6 +304,8 @@ reactions:
 | `TAVILY_API_KEY` | 联网搜索 API Key（可选） | — |
 | `DATABASE_PATH` | 数据库路径 | `data/xiaomo.db` |
 | `HF_ENDPOINT` | HuggingFace 镜像 | `https://hf-mirror.com` |
+| `HOST` | NoneBot 监听地址 | `127.0.0.1` |
+| `PORT` | NoneBot 监听端口 | `8080` |
 | `ONEBOT_WS_URL` | OneBot WS 地址 | `ws://127.0.0.1:3001` |
 
 ## 自定义人设
@@ -333,6 +339,15 @@ reactions:
 1. 确认 LLBot/NapCatQQ 已正确安装并登录 QQ
 2. 确认 OneBot WebSocket 地址一致（正向或反向）
 3. 查看控制台是否有连接日志
+
+服务健康状态可直接查看：
+
+```text
+GET /healthz  # Python 服务是否存活
+GET /readyz   # QQ 桥接是否已经连接
+```
+
+两个接口还会返回 `semantic_memory.status`（`initializing`、`ready` 或 `degraded`），可用于判断语义记忆是否完成加载；语义记忆降级不会阻断基础群聊。
 
 ### 首次启动下载模型很慢
 

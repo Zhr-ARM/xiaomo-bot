@@ -32,6 +32,9 @@ repeat_lock: dict[str, bool] = {}
 # 冒泡最后触发时间
 bubble_last_time: dict[str, float] = {}
 
+# 冒泡判断最后尝试时间（即使 AI 拒绝也短暂冷却）
+bubble_attempt_last_time: dict[str, float] = {}
+
 # 复读最后触发时间
 repeat_last_time: dict[str, float] = {}
 
@@ -70,7 +73,7 @@ IMAGE_CACHE_TTL = 300
 
 RECENT_WINDOW_SECONDS = 300.0
 RECENT_TEXT_WINDOW_SECONDS = 180.0
-RECENT_TEXT_LIMIT = 16
+RECENT_TEXT_LIMIT = 48
 
 
 def trim_recent_times(
@@ -109,6 +112,10 @@ def record_recent_group_text(
     user_qq: str | None,
     nickname: str | None,
     text: str,
+    source_message_id: str | None = None,
+    mentioned_qqs: list[str] | None = None,
+    reply_to_message_id: str | None = None,
+    carried_from_previous: bool = False,
     now: float | None = None,
 ) -> None:
     """Record a short-lived group text snippet for ambient participation."""
@@ -129,6 +136,10 @@ def record_recent_group_text(
             "user_qq": str(user_qq or ""),
             "nickname": (nickname or "").strip(),
             "text": clean[:240],
+            "source_message_id": str(source_message_id or ""),
+            "mentioned_qqs": [str(qq) for qq in (mentioned_qqs or [])],
+            "reply_to_message_id": str(reply_to_message_id or ""),
+            "carried_from_previous": bool(carried_from_previous),
         }
     )
     group_recent_texts[group_id] = recent[-RECENT_TEXT_LIMIT:]
@@ -138,6 +149,7 @@ def format_recent_group_flow(
     group_id: str,
     *,
     limit: int = 8,
+    exclude_source_message_id: str | None = None,
     now: float | None = None,
 ) -> str:
     """Format recent in-memory group flow for prompt context."""
@@ -153,7 +165,14 @@ def format_recent_group_flow(
         return ""
 
     lines = []
-    for item in recent[-max(1, int(limit)):]:
+    visible = [
+        item
+        for item in recent
+        if not exclude_source_message_id
+        or str(item.get("source_message_id") or "")
+        != str(exclude_source_message_id)
+    ]
+    for item in visible[-max(1, int(limit)):]:
         name = item.get("nickname") or (
             f"QQ{item.get('user_qq')}" if item.get("user_qq") else "成员"
         )
@@ -163,7 +182,43 @@ def format_recent_group_flow(
     return "\n".join(lines)
 
 
-def mark_proactive_join_sent(group_id: str, *, now: float | None = None) -> None:
+def find_recent_text_by_user(
+    group_id: str,
+    *,
+    user_qq: str,
+    exclude_source_message_id: str | None = None,
+    max_age_seconds: float = 75.0,
+    now: float | None = None,
+) -> dict | None:
+    """Find the sender's previous text for a split "message then @bot" turn."""
+
+    if now is None:
+        now = time.time()
+    for item in reversed(group_recent_texts.get(group_id, [])):
+        if now - float(item.get("time", 0)) > max_age_seconds:
+            continue
+        if str(item.get("user_qq") or "") != str(user_qq):
+            continue
+        if (
+            exclude_source_message_id
+            and str(item.get("source_message_id") or "")
+            == str(exclude_source_message_id)
+        ):
+            continue
+        if item.get("carried_from_previous"):
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            return item
+    return None
+
+
+def mark_proactive_join_sent(
+    group_id: str,
+    *,
+    source_message_id: str | None = None,
+    now: float | None = None,
+) -> None:
     """Start a feedback window after an ambient proactive reply is sent."""
     if now is None:
         now = time.time()
@@ -172,6 +227,7 @@ def mark_proactive_join_sent(group_id: str, *, now: float | None = None) -> None
     data["pending"] = {
         "sent_at": now,
         "expires_at": now + 180.0,
+        "source_message_id": str(source_message_id or ""),
     }
 
 
@@ -180,6 +236,9 @@ def observe_proactive_join_feedback(
     *,
     user_qq: str | None = None,
     bot_qq: str | None = None,
+    text: str = "",
+    mentions_bot: bool = False,
+    reply_to_message_id: str | None = None,
     now: float | None = None,
 ) -> str | None:
     """Update feedback score when the next human message arrives."""
@@ -196,12 +255,27 @@ def observe_proactive_join_feedback(
         return None
 
     score = float(data.get("score", 0.0))
-    if now <= float(pending.get("expires_at", 0)):
+    pending_source = str(pending.get("source_message_id") or "")
+    direct_reply = bool(
+        pending_source
+        and reply_to_message_id
+        and pending_source == str(reply_to_message_id)
+    )
+    normalized = (text or "").strip().lower()
+    conversational_signal = any(
+        cue in normalized
+        for cue in ("?", "？", "哈哈", "确实", "对", "不是", "怎么", "为啥", "谢谢")
+    )
+    if now <= float(pending.get("expires_at", 0)) and (
+        mentions_bot or direct_reply or conversational_signal
+    ):
         score = min(0.35, score + 0.08)
         outcome = "continued"
-    else:
+    elif now > float(pending.get("expires_at", 0)):
         score = max(-0.35, score - 0.05)
         outcome = "stalled"
+    else:
+        return "neutral"
 
     data["score"] = score
     data["last_outcome"] = outcome

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "xiaomo-bot"
 version = "1.0.0"
 description = "小源 - QQ猫娘聊天机器人"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "nonebot2[fastapi]>=2.3.0",
     "nonebot-adapter-onebot>=2.4.0",
@@ -21,6 +21,7 @@ dependencies = [
     "tavily-python>=0.7.0",
     "chromadb>=0.5.0",
     "sentence-transformers>=3.0.0",
+    "zhdate>=0.1",
 ]
 
 [tool.setuptools.packages.find]

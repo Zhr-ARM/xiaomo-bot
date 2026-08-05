@@ -64,6 +64,15 @@ def test_persona_includes_member_style_notes():
     assert "互动习惯：爱开玩笑" in prompt
 
 
+def test_persona_keeps_roleplay_inside_reality_boundary():
+    prompt = persona.build_system_prompt(group_id="g1")
+
+    assert "你只在线上群聊中存在" in prompt
+    assert "不得声称自己真的在窗台" in prompt
+    assert "同一成员先发一句话、随后单独 @ 你" in prompt
+    assert len(prompt) < 5000
+
+
 @pytest.mark.asyncio
 async def test_update_user_profile_refreshes_live_nickname(monkeypatch, tmp_path):
     await database.close_database()

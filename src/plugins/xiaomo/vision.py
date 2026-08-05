@@ -151,6 +151,11 @@ async def describe_image_from_file(
         path = Path(file_path)
         if not path.exists():
             return "[图片文件不存在]"
+        size = path.stat().st_size
+        if size > max_size:
+            size_mb = size / 1024 / 1024
+            logger.warning("本地图片过大 (%.1fMB)，跳过识别", size_mb)
+            return f"[图片过大 ({size_mb:.1f}MB)]"
 
         data = path.read_bytes()
         return await describe_image_from_bytes(data, custom_prompt)

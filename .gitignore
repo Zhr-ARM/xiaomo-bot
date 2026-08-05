@@ -12,6 +12,8 @@ data/xiaomo.db
 data/xiaomo.db-shm
 data/xiaomo.db-wal
 data/vector_db/
+data/bot.pid
+data/startup_history/
 
 # Python
 __pycache__/

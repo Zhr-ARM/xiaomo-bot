@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 from openai import AsyncOpenAI
 
@@ -41,10 +40,20 @@ class LLMClient:
         mode: str = "normal",
         structured_history: list[dict] | None = None,
         group_id: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         """发送聊天请求到 MiMo API，支持多轮对话格式"""
-        system = build_system_prompt(
-            scene=scene, user_profile=user_profile, mode=mode, group_id=group_id,
+        system = system_prompt or build_system_prompt(
+            scene=scene,
+            user_profile=user_profile,
+            mode=mode,
+            group_id=group_id,
+        )
+        request_max_tokens = max_tokens or self.max_tokens
+        request_temperature = (
+            self.temperature if temperature is None else temperature
         )
 
         if structured_history:
@@ -64,8 +73,8 @@ class LLMClient:
 
             response = await self._client.chat.completions.create(
                 model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
+                max_tokens=request_max_tokens,
+                temperature=request_temperature,
                 messages=messages,
             )
         else:
@@ -79,8 +88,8 @@ class LLMClient:
 
             response = await self._client.chat.completions.create(
                 model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
+                max_tokens=request_max_tokens,
+                temperature=request_temperature,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_content},
@@ -89,6 +98,26 @@ class LLMClient:
 
         content = (response.choices[0].message.content or "").strip()
         return content if content else "喵...小源卡住了 (´;ω;`)"
+
+    async def decision(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        max_tokens: int = 160,
+    ) -> str:
+        """Run a compact classifier without persona, history, or long output."""
+
+        response = await self._client.chat.completions.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return (response.choices[0].message.content or "").strip()
 
     async def generate_summary(self, messages_text: str) -> str:
         """生成对话摘要（用于记忆压缩）"""

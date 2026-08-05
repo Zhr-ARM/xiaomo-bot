@@ -2,6 +2,8 @@
 from nonebot import get_driver
 from nonebot.plugin import PluginMetadata
 
+from .observability import configure_logging
+
 __plugin_meta__ = PluginMetadata(
     name="小源",
     description="一只可爱的猫娘QQ聊天机器人 (｡･ω･｡)",
@@ -10,6 +12,7 @@ __plugin_meta__ = PluginMetadata(
 )
 
 driver = get_driver()
+configure_logging()
 
 
 @driver.on_startup
@@ -17,6 +20,15 @@ async def _startup():
     """NoneBot2 启动时初始化"""
     from .database import init_database
     await init_database()
+
+    from . import state
+    state.db_initialized = True
+
+    from .runtime_state import restore
+    await restore()
+
+    from .health import install_health_routes
+    install_health_routes()
 
     from .vector_store import start_vector_store_init
     start_vector_store_init()
@@ -34,11 +46,23 @@ async def _startup():
 @driver.on_shutdown
 async def _shutdown():
     """关闭时清理"""
-    from .database import close_database
-    await close_database()
+    from .weather import stop_weather_scheduler
+    stop_weather_scheduler()
+
+    from .auto_action import stop_bubble_loop
+    await stop_bubble_loop()
+
+    from .window import get_silent_window
+    await get_silent_window().close()
+
+    from .runtime_state import shutdown as shutdown_runtime_state
+    await shutdown_runtime_state()
+
+    from .memory import close_memory_tasks
+    await close_memory_tasks()
 
     from .vector_store import close_vector_store
     await close_vector_store()
 
-    from .weather import stop_weather_scheduler
-    stop_weather_scheduler()
+    from .database import close_database
+    await close_database()

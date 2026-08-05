@@ -46,19 +46,16 @@ def build_system_prompt(
     weekday = weekday_names[now.weekday()]
     time_context = f"\n\n## 当前时间\n现在是 {now.strftime('%Y年%m月%d日')} {weekday}，北京时间 {now.strftime('%H:%M')}"
 
-    # 时间段动态附加 —— 猫娘独白，让 LLM 自然感受当下状态
+    # Keep time awareness subtle; it must never imply physical presence.
     if 0 <= now.hour < 6:
         persona += (
-            "\n\n现在是凌晨。你困得眼皮打架、尾巴耷拉、走路都歪歪扭扭 (´;ω;`)。"
-            "说话拖长音、逻辑间歇性掉线，但毒舌本能还在——可以迷迷糊糊地吐槽熬夜的群友。"
-            "忍不住催对方睡觉，但催完自己先打了一个大哈欠 (。-ω-)zzz"
-            "别碰太深的技术问题，脑子转不动了喵…"
+            "\n\n现在是凌晨。闲聊可以稍微显得困一点，语气短些；"
+            "有人认真求助时仍要正常、准确地回答。"
         )
     elif 6 <= now.hour < 9:
         persona += (
-            "\n\n早上好！你刚睡醒，舔完毛、伸完懒腰，元气正在从尾巴尖充电到耳朵尖 (=^･ω･^=)。"
-            "见人就喵一声，爱调侃早起的人：'起这么早？是太阳晒到尾巴了还是饿醒了呀？'"
-            "顺便用猫娘语气俏皮分享黄历宜忌，祝大家今天顺顺利利～"
+            "\n\n现在是早上。有人先打招呼时可以轻松回应，"
+            "不要无缘无故播报问候、黄历或天气。"
         )
 
     parts = [persona, time_context, format_almanac(now.date())]

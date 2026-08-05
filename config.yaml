@@ -34,6 +34,7 @@ vision:
 
 weather:
   target_group: "1056259135"
+  city: "成都"
 
 # 联网搜索 (Tavily Search API)
 web_search:
@@ -42,6 +43,7 @@ web_search:
   search_depth: "basic"        # basic | advanced
   include_answer: true         # 包含 AI 答案摘要
   natural_query: true          # 自动检测自然语言问句并搜索
+  timeout_seconds: 8           # 搜索超时就先回复，不长期卡住群聊
 
 # 主动发言（非 @、非叫小源的自动消息）
 proactive:
@@ -108,7 +110,9 @@ silent_window:
 
 auto_action:
   bubble_inactive_minutes: 30
+  bubble_max_inactive_minutes: 180
   bubble_cooldown_minutes: 60
+  bubble_attempt_cooldown_minutes: 15
   repeat_threshold: 3
   repeat_cooldown_minutes: 30
 

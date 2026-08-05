@@ -25,18 +25,16 @@ logger = logging.getLogger("xiaomo.auto_action")
 CST = timezone(timedelta(hours=8))
 
 BUBBLE_QUOTES = [
-    "喵呜...群里好安静呀 (´･ω･`) 大家都睡着了吗？",
-    "伸个懒腰～ ( =①ω①=) 有人来陪小源玩嘛？",
-    "(｡>﹏<｡) 好无聊呀，数毛线球中...一个毛线球、两个毛线球...",
-    "呼喵～小源来冒个泡！咕噜咕噜 ○ °。○ 。Ｏ°",
-    "今天天气真好喵 (=^･ω･=) 适合晒太阳～",
-    "_(:3 」∠)_ 小源趴在键盘上等大家回来...",
-    "盯—— 手机屏幕好安静呢 (｀・ω・´)",
-    "肚子饿了喵...有人带了小鱼干吗？(´;ω;`)",
-    "喵喵喵！小源巡逻到此，一切正常！o(｀ω´)o",
-    "无聊到开始追自己尾巴玩了...(´∀｀; )",
-    "咦？群里好安静，需要小源来搞点气氛咩？✨",
-    "zzZZ...啊！小源没有睡着！只是在闭目养神而已！(ﾉ>ω<)ﾉ",
+    "刚才那个事后来解决没？",
+    "所以最后咋定的？",
+    "我有点好奇，后续呢",
+    "刚才那段还有下文吗",
+    "这个坑最后填上没？",
+    "你们刚聊的那个，有结论了吗",
+    "说到一半没了，后来咋样",
+    "这事我还惦记着，搞定了吗",
+    "刚才那个思路有人试了吗",
+    "最后用的是哪个方案？",
 ]
 
 _bubble_task: asyncio.Task | None = None
@@ -121,15 +119,24 @@ async def _default_proactive_ai_decider(payload: dict) -> bool:
         f"候选发言：{payload.get('candidate_text', '')}\n"
         f"近期群聊背景：\n{payload.get('recent_context', '') or '无'}"
     )
-    reply = await get_llm().chat(
-        context="",
-        user_profile=None,
-        scene="group",
-        user_message=prompt,
-        mode="normal",
-        structured_history=None,
-        group_id=payload.get("group_id"),
-    )
+    llm = get_llm()
+    decision = getattr(llm, "decision", None)
+    if callable(decision):
+        reply = await decision(
+            system="你是群聊主动发言审核器，只输出要求的 JSON。",
+            prompt=prompt,
+            max_tokens=120,
+        )
+    else:
+        reply = await llm.chat(
+            context="",
+            user_profile=None,
+            scene="group",
+            user_message=prompt,
+            mode="normal",
+            structured_history=None,
+            group_id=payload.get("group_id"),
+        )
     return _parse_proactive_decision(reply)
 
 
@@ -183,7 +190,8 @@ async def should_send_proactive_message(
         return True
 
     if ai_decider is None:
-        recent_context = await _recent_group_context(group_id)
+        if recent_context is None:
+            recent_context = await _recent_group_context(group_id)
         ai_decider = _default_proactive_ai_decider
 
     payload = {
@@ -221,7 +229,9 @@ async def start_bubble_loop():
         config = get_config()
         auto_cfg = config.get("auto_action", {})
         inactive_min = auto_cfg.get("bubble_inactive_minutes", 30)
+        max_inactive_min = auto_cfg.get("bubble_max_inactive_minutes", 180)
         cooldown_min = auto_cfg.get("bubble_cooldown_minutes", 60)
+        attempt_cooldown_min = auto_cfg.get("bubble_attempt_cooldown_minutes", 15)
 
         while True:
             await asyncio.sleep(60)
@@ -239,32 +249,56 @@ async def start_bubble_loop():
                     continue
                 inactive_for = (now - state.group_last_active.get(gid, now)) / 60
 
-                if inactive_for < inactive_min:
+                if inactive_for < inactive_min or inactive_for > max_inactive_min:
                     continue
 
                 last_bubble = state.bubble_last_time.get(gid, 0)
                 if (now - last_bubble) / 60 < cooldown_min:
                     continue
 
+                last_attempt = state.bubble_attempt_last_time.get(gid, 0)
+                if (now - last_attempt) / 60 < attempt_cooldown_min:
+                    continue
+
                 if random.random() < 0.5:
                     continue
 
                 quote = random.choice(BUBBLE_QUOTES)
+                recent_context = await _recent_group_context(gid)
+                if not recent_context:
+                    continue
+                state.bubble_attempt_last_time[gid] = now
+                from .runtime_state import schedule_persist
+
+                schedule_persist()
                 if not await should_send_proactive_message(
                     group_id=gid,
                     reason="bubble",
                     candidate_text=quote,
+                    recent_context=recent_context,
                 ):
                     continue
                 try:
-                    await bot.send_group_msg(group_id=int(gid), message=quote)
-                    state.record_bot_reply(gid, now=now)
+                    from .delivery import send_group_text
+
+                    await send_group_text(bot, gid, quote)
                     state.bubble_last_time[gid] = now
                     logger.info("Bubble in group %s", gid)
                 except Exception as e:
                     logger.error("Bubble failed in group %s: %s", gid, e)
 
     _bubble_task = asyncio.create_task(_loop())
+
+
+async def stop_bubble_loop() -> None:
+    global _bubble_task
+    if _bubble_task is not None and not _bubble_task.done():
+        _bubble_task.cancel()
+        try:
+            await _bubble_task
+        except asyncio.CancelledError:
+            pass
+    _bubble_task = None
 
 
 # ─── 复读检测 ──────────────────────────────────────────────────────────────────

@@ -4,8 +4,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import time
+from collections.abc import Callable
 
 from sqlalchemy import select, desc, delete
 
@@ -19,10 +21,38 @@ from .database import (
     get_session,
     get_user_display_names,
     get_user_profile_summary,
+    save_inbound_group_message,
     save_message,
 )
 
 logger = logging.getLogger("xiaomo.memory")
+_compression_tasks: dict[str, asyncio.Task] = {}
+_vector_index_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_vector_index(**kwargs) -> None:
+    if len(_vector_index_tasks) >= 256:
+        logger.warning("Vector index backlog is full; skipping one message")
+        return
+
+    async def _run() -> None:
+        from .vector_store import add_message
+
+        await add_message(**kwargs)
+
+    task = asyncio.create_task(_run(), name="xiaomo-vector-index-message")
+    _vector_index_tasks.add(task)
+
+    def _finished(done: asyncio.Task) -> None:
+        _vector_index_tasks.discard(done)
+        exception = None if done.cancelled() else done.exception()
+        if exception is not None:
+            logger.error(
+                "Background vector indexing failed",
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+
+    task.add_done_callback(_finished)
 
 
 # ─── Weight Decay ─────────────────────────────────────────────────────────────
@@ -295,20 +325,58 @@ async def store_memory(
 
     # 同步写向量库（用户消息才需要语义搜索）
     if role == "user" and content.strip():
-        try:
-            from .vector_store import add_message
-            await add_message(
-                message_id=msg.id,
-                content=content,
-                user_qq=user_qq,
-                group_id=group_id,
-                scene=scene,
-                created_at=msg.created_at,
-            )
-        except Exception:
-            logger.exception("Failed to add to vector store")
+        _schedule_vector_index(
+            message_id=msg.id,
+            content=content,
+            user_qq=user_qq,
+            group_id=group_id,
+            scene=scene,
+            created_at=msg.created_at,
+        )
 
     return msg.id
+
+
+async def store_inbound_memory(
+    *,
+    group_id: str,
+    source_message_id: str,
+    user_qq: str,
+    nickname: str | None,
+    content: str,
+    profile_learner: Callable[[dict, str], dict] | None = None,
+) -> tuple[int | None, bool]:
+    """Persist an incoming OneBot message once and update its sender atomically."""
+
+    message = None
+    created = False
+    async with await get_session() as session:
+        message, created, user = await save_inbound_group_message(
+            session,
+            group_id=group_id,
+            source_message_id=source_message_id,
+            user_qq=user_qq,
+            nickname=nickname,
+            content=content,
+        )
+        if created and user is not None and profile_learner is not None:
+            current_profile = user.get_profile()
+            learned_profile = profile_learner(current_profile, content)
+            if learned_profile != current_profile:
+                user.set_profile(learned_profile)
+        await session.commit()
+
+    if created and message is not None and content.strip():
+        _schedule_vector_index(
+            message_id=message.id,
+            content=content,
+            user_qq=user_qq,
+            group_id=group_id,
+            scene="group",
+            created_at=message.created_at,
+        )
+
+    return (message.id if message is not None else None), created
 
 
 async def compress_old_memories(
@@ -342,9 +410,13 @@ async def compress_old_memories(
         if len(to_compress) < 10:
             return
 
+        # Only delete messages represented by this summary. The query is newest
+        # first, so the tail is the oldest bounded batch.
+        compress_batch = to_compress[-100:]
+
         # 构建压缩文本
         compress_text_parts = []
-        for m in reversed(to_compress[-100:]):  # 取最近 100 条，按时间正序
+        for m in reversed(compress_batch):
             role_name = "用户" if m.role == "user" else "小源"
             compress_text_parts.append(f"[{role_name}]: {m.content[:300]}")
         compress_text = "\n".join(compress_text_parts)
@@ -366,12 +438,12 @@ async def compress_old_memories(
             group_id=group_id,
             scene=scene,
             summary=summary_text,
-            start_message_id=to_compress[-1].id,
-            end_message_id=to_compress[0].id,
+            start_message_id=compress_batch[-1].id,
+            end_message_id=compress_batch[0].id,
         )
         session.add(compressed)
 
-        compress_ids = [m.id for m in to_compress]
+        compress_ids = [m.id for m in compress_batch]
         await session.execute(delete(Message).where(Message.id.in_(compress_ids)))
         await session.commit()
 
@@ -380,3 +452,44 @@ async def compress_old_memories(
             await delete_messages(compress_ids)
         except Exception:
             logger.exception("Failed to clean compressed vector memories")
+
+
+def schedule_memory_compression(
+    scene: str,
+    user_qq: str | None,
+    group_id: str | None,
+    threshold: int,
+) -> None:
+    """Run at most one background compression job per conversation."""
+
+    key = f"{scene}:{group_id or user_qq or 'global'}"
+    current = _compression_tasks.get(key)
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(
+        compress_old_memories(scene, user_qq, group_id, threshold),
+        name=f"xiaomo-memory-compress-{key}",
+    )
+    _compression_tasks[key] = task
+
+    def _finished(done: asyncio.Task) -> None:
+        _compression_tasks.pop(key, None)
+        exception = None if done.cancelled() else done.exception()
+        if exception is not None:
+            logger.error(
+                "Background memory compression failed",
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+
+    task.add_done_callback(_finished)
+
+
+async def close_memory_tasks() -> None:
+    tasks = list(_compression_tasks.values()) + list(_vector_index_tasks)
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _compression_tasks.clear()
+    _vector_index_tasks.clear()

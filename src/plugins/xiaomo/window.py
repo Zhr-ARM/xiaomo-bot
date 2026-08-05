@@ -30,11 +30,20 @@ class SilentWindow:
         config = get_config().get("silent_window", {})
         self._private_seconds: float = config.get("private_seconds", 3)
         self._group_seconds: float = config.get("group_seconds", 5)
+        self._max_pending_per_key: int = max(
+            2, int(config.get("max_pending_per_key", 24))
+        )
+        self._max_pending_total: int = max(
+            self._max_pending_per_key,
+            int(config.get("max_pending_total", 240)),
+        )
         self._timers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, list[dict]] = defaultdict(list)
         self._callback: ReplyCallback | None = None
+        self._closed = False
         # 正在处理中的 key 集合 — 此时新消息不打断，只缓冲
         self._processing: set[str] = set()
+        self._processing_tasks: dict[str, asyncio.Task] = {}
         # 记录每个 key 是群聊还是私聊，处理完重启计时器时用
         self._is_group: dict[str, bool] = {}
         # 每个 key 的本轮等待时长；显式 @ 可以使用更短窗口，普通群聊仍用默认窗口。
@@ -57,7 +66,11 @@ class SilentWindow:
 
         如果回调正在处理中（LLM 调用进行中），只缓冲消息，不打断。
         """
+        if self._closed:
+            logger.warning("SilentWindow ignored message after shutdown: %s", key)
+            return
         self._pending[key].append(message)
+        self._enforce_limits(key)
         self._is_group[key] = is_group
         default_wait = self._group_seconds if is_group else self._private_seconds
         self._wait_seconds[key] = default_wait if wait_seconds is None else max(0.0, float(wait_seconds))
@@ -75,6 +88,50 @@ class SilentWindow:
             self._wait_then_fire(key, self._wait_seconds[key])
         )
 
+    @staticmethod
+    def _message_priority(index: int, message: dict) -> tuple[int, float, int]:
+        try:
+            timestamp = float(message.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        return (1 if message.get("explicit_trigger") else 0, timestamp, index)
+
+    def _enforce_limits(self, changed_key: str) -> None:
+        bucket = self._pending[changed_key]
+        if len(bucket) > self._max_pending_per_key:
+            keep_indices = sorted(
+                sorted(
+                    range(len(bucket)),
+                    key=lambda idx: self._message_priority(idx, bucket[idx]),
+                    reverse=True,
+                )[: self._max_pending_per_key]
+            )
+            dropped = len(bucket) - len(keep_indices)
+            self._pending[changed_key] = [bucket[idx] for idx in keep_indices]
+            logger.warning(
+                "SilentWindow dropped %d queued messages for %s", dropped, changed_key
+            )
+
+        while sum(len(messages) for messages in self._pending.values()) > self._max_pending_total:
+            candidates = []
+            for key, messages in self._pending.items():
+                for index, queued in enumerate(messages):
+                    candidates.append(
+                        (
+                            1 if queued.get("explicit_trigger") else 0,
+                            float(queued.get("timestamp") or 0),
+                            key,
+                            index,
+                        )
+                    )
+            if not candidates:
+                break
+            _, _, key, index = min(candidates)
+            self._pending[key].pop(index)
+            if not self._pending[key]:
+                self._pending.pop(key, None)
+            logger.warning("SilentWindow global queue cap dropped a message for %s", key)
+
     async def _wait_then_fire(self, key: str, seconds: float):
         """等待窗口到期，然后触发回调"""
         try:
@@ -83,6 +140,9 @@ class SilentWindow:
             # 进入处理阶段 — 新消息不会再取消我们
             self._timers.pop(key, None)
             self._processing.add(key)
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._processing_tasks[key] = current_task
 
             messages = self._pending.pop(key, [])
 
@@ -95,9 +155,10 @@ class SilentWindow:
             logger.exception("SilentWindow callback failed for key %s", key)
         finally:
             self._processing.discard(key)
+            self._processing_tasks.pop(key, None)
 
             # 处理期间有新消息到达 → 重启计时器，不让它们被遗忘
-            if key in self._pending and self._pending[key]:
+            if not self._closed and key in self._pending and self._pending[key]:
                 is_grp = self._is_group.get(key, False)
                 wait = self._wait_seconds.get(
                     key,
@@ -120,6 +181,22 @@ class SilentWindow:
         messages = self._pending.pop(key, [])
         return messages
 
+    async def close(self) -> None:
+        """Cancel waiting and in-flight callbacks during application shutdown."""
+
+        self._closed = True
+        tasks = set(self._timers.values()) | set(self._processing_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._timers.clear()
+        self._processing_tasks.clear()
+        self._processing.clear()
+        self._pending.clear()
+        self._wait_seconds.clear()
+
 
 # 全局单例
 _silent_window: SilentWindow | None = None
@@ -127,6 +204,6 @@ _silent_window: SilentWindow | None = None
 
 def get_silent_window() -> SilentWindow:
     global _silent_window
-    if _silent_window is None:
+    if _silent_window is None or _silent_window._closed:
         _silent_window = SilentWindow()
     return _silent_window

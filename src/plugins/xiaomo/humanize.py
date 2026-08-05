@@ -279,15 +279,23 @@ async def decide_reply_strategy(
     )
     try:
         async with asyncio.timeout(timeout_seconds):
-            reply = await llm.chat(
-                context="",
-                user_profile=user_profile,
-                scene="group",
-                user_message=prompt,
-                mode="normal",
-                structured_history=None,
-                group_id=group_id,
-            )
+            decision = getattr(llm, "decision", None)
+            if callable(decision):
+                reply = await decision(
+                    system="你是群聊回复策略分类器，只输出要求的 JSON。",
+                    prompt=prompt,
+                    max_tokens=180,
+                )
+            else:
+                reply = await llm.chat(
+                    context="",
+                    user_profile=user_profile,
+                    scene="group",
+                    user_message=prompt,
+                    mode="normal",
+                    structured_history=None,
+                    group_id=group_id,
+                )
         strategy = parse_strategy_reply(reply, fallback=fallback, max_delay=max_delay)
         if proactive:
             strategy.delay_seconds = min(

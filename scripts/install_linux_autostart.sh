@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVICE_NAME="xiaomo-bot.service"
 SERVICE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SERVICE_PATH="$SERVICE_DIR/$SERVICE_NAME"
-START_ARGS="--no-install"
+START_ARGS=""
 START_NOW=0
 DISABLE=0
 
@@ -58,6 +58,8 @@ WorkingDirectory="$ROOT_DIR"
 ExecStart=/usr/bin/env bash "$ROOT_DIR/start_bot.sh" $START_ARGS
 Restart=on-failure
 RestartSec=10
+KillMode=control-group
+TimeoutStopSec=30
 Environment=PYTHONIOENCODING=utf-8
 
 [Install]

@@ -239,12 +239,35 @@ def test_proactive_feedback_increases_probability_after_human_reply():
     state.mark_proactive_join_sent("g1", now=100.0)
 
     outcome = state.observe_proactive_join_feedback(
-        "g1", user_qq="u1", bot_qq="bot", now=120.0,
+        "g1",
+        user_qq="u1",
+        bot_qq="bot",
+        text="你说得对？",
+        mentions_bot=True,
+        now=120.0,
     )
 
     assert outcome == "continued"
     assert state.proactive_join_last_time["g1"] == 100.0
     assert state.proactive_join_probability_multiplier("g1") > 1.0
+
+
+def test_unrelated_next_message_is_neutral_proactive_feedback():
+    from src.plugins.xiaomo import state
+
+    state.proactive_join_feedback.clear()
+    state.mark_proactive_join_sent("g1", now=100.0)
+
+    outcome = state.observe_proactive_join_feedback(
+        "g1",
+        user_qq="u1",
+        bot_qq="bot",
+        text="换个话题",
+        now=120.0,
+    )
+
+    assert outcome == "neutral"
+    assert state.proactive_join_probability_multiplier("g1") == 1.0
 
 
 def test_proactive_feedback_decreases_probability_after_stall():

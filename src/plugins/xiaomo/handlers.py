@@ -22,18 +22,20 @@ from .database import (
     Nickname,
     User,
     UserNickname,
+    get_message_by_source_id,
     init_database,
-    get_or_create_user,
     get_session,
     get_user_display_names,
     get_user_profile_summary,
+    update_message_content,
 )
+from .delivery import send_group_text
 from .llm import get_llm
 from .memory import (
     build_context,
-    compress_old_memories,
     group_key,
-    store_memory,
+    schedule_memory_compression,
+    store_inbound_memory,
 )
 from .window import get_silent_window
 from .auto_action import (
@@ -121,7 +123,7 @@ _WEATHER_PATTERNS = [
     "刮风", "风大", "大风",
     "雾霾", "雾", "霾",
     "出太阳", "晴天", "阴天",
-    "外面冷", "外面热", "外面",
+    "外面冷", "外面热",
 ]
 
 
@@ -737,16 +739,148 @@ def _is_text_at_mention(event: GroupMessageEvent, bot_qq: str | None = None) -> 
 
 
 def _extract_at_text(event: GroupMessageEvent, bot_qq: str) -> str:
-    text = ""
+    parts: list[str] = []
+    bot_names = sorted(_bot_name_candidates(bot_qq), key=len, reverse=True)
     for seg in event.message:
         if seg.type == "text":
             t = seg.data.get("text", "")
-            t = re.sub(r"@\S+\s*", "", t)
-            text += t
+            for name in bot_names:
+                t = t.replace(f"@{name}", "")
+            if t:
+                parts.append(t)
         elif seg.type == "at":
-            if seg.data.get("qq") != bot_qq:
-                text += f"@{seg.data.get('qq', 'unknown')}"
-    return text.strip()
+            qq = str(seg.data.get("qq", ""))
+            if qq != str(bot_qq):
+                display = seg.data.get("name") or qq or "unknown"
+                parts.append(f"@{display}")
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def _extract_mentioned_qqs(event: GroupMessageEvent) -> list[str]:
+    return [
+        str(seg.data.get("qq"))
+        for seg in event.message
+        if seg.type == "at" and seg.data.get("qq") is not None
+    ]
+
+
+def _extract_reply_message_id(event: GroupMessageEvent) -> str | None:
+    for seg in event.message:
+        if seg.type == "reply":
+            value = seg.data.get("id") or seg.data.get("message_id")
+            if value is not None:
+                return str(value)
+    return None
+
+
+def _event_source_message_id(event: MessageEvent) -> str:
+    value = getattr(event, "message_id", None)
+    if value is not None:
+        return str(value)
+    return f"ephemeral:{event.user_id}:{_time.time_ns()}"
+
+
+def _resolve_message_text(
+    *,
+    group_id: str,
+    user_qq: str,
+    source_message_id: str,
+    text: str,
+    at_text: str,
+    should_respond: bool,
+    now: float,
+) -> tuple[str, bool]:
+    """Resolve a split turn where a standalone @bot submits prior text."""
+
+    message_text = (at_text or text or "").strip()
+    carried_from_previous = False
+    if should_respond and not at_text:
+        previous = state.find_recent_text_by_user(
+            group_id,
+            user_qq=user_qq,
+            exclude_source_message_id=source_message_id,
+            now=now,
+        )
+        if previous is not None:
+            message_text = str(previous.get("text") or "").strip()
+            carried_from_previous = bool(message_text)
+    if not message_text:
+        message_text = "[有成员@了小源]" if should_respond else "[非文本群消息]"
+    return message_text, carried_from_previous
+
+
+def _message_payload_text(payload) -> str:
+    if isinstance(payload, str):
+        return re.sub(r"\[CQ:[^\]]+\]", "", payload).strip()
+    if not isinstance(payload, list):
+        return ""
+    parts = []
+    for segment in payload:
+        if not isinstance(segment, dict):
+            continue
+        data = segment.get("data") or {}
+        if segment.get("type") == "text":
+            parts.append(str(data.get("text") or ""))
+        elif segment.get("type") == "at":
+            parts.append(f"@{data.get('name') or data.get('qq') or '成员'}")
+    return " ".join(part.strip() for part in parts if part.strip()).strip()
+
+
+async def _resolve_reply_context(
+    bot: Bot,
+    *,
+    group_id: str,
+    reply_to_message_id: str | None,
+) -> tuple[str, str | None]:
+    if not reply_to_message_id:
+        return "", None
+
+    async with await get_session() as session:
+        quoted = await get_message_by_source_id(
+            session,
+            group_id=group_id,
+            source_message_id=reply_to_message_id,
+        )
+        if quoted is not None:
+            names = await get_user_display_names(session, [quoted.user_qq])
+            speaker = names.get(str(quoted.user_qq or "")) or (
+                f"QQ{quoted.user_qq}" if quoted.user_qq else "小源"
+            )
+            return (
+                f"[回复 {speaker} (QQ:{quoted.user_qq or 'bot'})]: "
+                f"{quoted.content[:300]}",
+                quoted.user_qq,
+            )
+
+    try:
+        response = await asyncio.wait_for(
+            bot.call_api("get_msg", message_id=int(reply_to_message_id)),
+            timeout=2.5,
+        )
+    except Exception:
+        logger.info(
+            "Unable to resolve reply target: group=%s message=%s",
+            group_id,
+            reply_to_message_id,
+        )
+        return "", None
+
+    if not isinstance(response, dict):
+        return "", None
+    sender = response.get("sender") or {}
+    quoted_qq = sender.get("user_id") or response.get("user_id")
+    speaker = sender.get("card") or sender.get("nickname") or (
+        f"QQ{quoted_qq}" if quoted_qq else "成员"
+    )
+    quoted_text = _message_payload_text(response.get("message"))
+    if not quoted_text:
+        quoted_text = str(response.get("raw_message") or "").strip()
+    if not quoted_text:
+        return "", str(quoted_qq) if quoted_qq else None
+    return (
+        f"[回复 {speaker} (QQ:{quoted_qq or 'unknown'})]: {quoted_text[:300]}",
+        str(quoted_qq) if quoted_qq else None,
+    )
 
 
 async def _update_user_profile(
@@ -756,13 +890,22 @@ async def _update_user_profile(
     text: str = "",
 ):
     async with await get_session() as session:
-        user = await get_or_create_user(session, qq_id)
+        result = await session.execute(select(User).where(User.qq_id == qq_id))
+        user = result.scalar_one_or_none()
+        changed = user is None
+        if user is None:
+            user = User(qq_id=qq_id)
+            session.add(user)
         if nickname and user.nickname != nickname:
             user.nickname = nickname
-        learned = _learn_profile_traits(user.get_profile(), text)
-        if learned != user.get_profile():
+            changed = True
+        current_profile = user.get_profile()
+        learned = _learn_profile_traits(current_profile, text)
+        if learned != current_profile:
             user.set_profile(learned)
-        await session.commit()
+            changed = True
+        if changed:
+            await session.commit()
 
 
 # ─── 回复发送 ──────────────────────────────────────────────────────────────────
@@ -776,12 +919,7 @@ async def _send_group_reply(bot: Bot, group_id: str, content: str):
         print(f"[REPLY] group={group_id} len={len(content)}: {content[:200]}")
     except Exception:
         pass
-    await store_memory(
-        user_qq=None, group_id=group_id, scene="group",
-        role="assistant", content=content,
-    )
-    await bot.send_group_msg(group_id=int(group_id), message=content)
-    state.record_bot_reply(group_id)
+    return await send_group_text(bot, group_id, content)
 
 
 # ─── 核心处理逻辑 ──────────────────────────────────────────────────────────────
@@ -789,6 +927,7 @@ async def _send_group_reply(bot: Bot, group_id: str, content: str):
 
 async def _process_messages(key: str, messages: list[dict]):
     """静默窗口到期后，处理一批消息并生成回复"""
+    started_at = _time.perf_counter()
     if not messages:
         return
 
@@ -815,6 +954,14 @@ async def _process_messages(key: str, messages: list[dict]):
             )
         except Exception:
             pass
+    finally:
+        logger.info(
+            "Reply pipeline finished: group=%s batch=%d explicit=%s elapsed=%.3fs",
+            group_id,
+            len(messages),
+            any(bool(message.get("explicit_trigger")) for message in messages),
+            _time.perf_counter() - started_at,
+        )
 
 
 async def _process_messages_inner(
@@ -993,7 +1140,13 @@ async def _process_messages_inner(
 
     if search_task:
         try:
-            search_result = await search_task
+            search_timeout = float(
+                get_config().get("web_search", {}).get("timeout_seconds", 8)
+            )
+            search_result = await asyncio.wait_for(
+                search_task,
+                timeout=search_timeout,
+            )
             if search_result.context:
                 combined_text = (
                     f"{combined_text}\n\n"
@@ -1014,6 +1167,12 @@ async def _process_messages_inner(
                     f"查询: {search_result.query or search_text}\n"
                     "回答时必须诚实说明无法确认最新信息，不要编造搜索结果。"
                 )
+        except asyncio.TimeoutError:
+            logger.warning("[Search] timed out for '%s'", search_text[:60])
+            combined_text = (
+                f"{combined_text}\n\n[联网工具状态]\n"
+                "实时搜索超时，回答时说明暂时无法确认最新信息，不要编造。"
+            )
         except Exception:
             logger.exception("[Search] error for '%s'", search_text[:60])
 
@@ -1051,6 +1210,7 @@ async def _process_messages_inner(
                         mode=mode,
                         structured_history=structured_history,
                         group_id=group_id,
+                        max_tokens=max(128, min(1200, reply_max_chars * 2)),
                     )
                     if join_instruction and _is_silent_join_reply(reply):
                         logger.info(
@@ -1128,25 +1288,25 @@ async def _process_messages_inner(
     ):
         return
 
-    print(f"[REPLY] Attempting to send: len={len(reply)}")
     try:
-        await _send_group_reply(bot, group_id, reply)
+        sent_message_id = await _send_group_reply(bot, group_id, reply)
         if join_instruction:
-            state.mark_proactive_join_sent(group_id)
+            state.mark_proactive_join_sent(
+                group_id,
+                source_message_id=sent_message_id,
+            )
             _trace_proactive(
                 "sent",
                 group_id,
                 action=current_msg.get("join_action", ""),
                 chars=len(reply),
             )
-        print("[REPLY] Sent successfully")
-    except Exception as e:
-        print(f"[REPLY] Failed to send: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.info("Reply sent: group=%s chars=%d", group_id, len(reply))
+    except Exception:
+        logger.exception("Reply delivery failed: group=%s", group_id)
 
     threshold = get_config().get("memory", {}).get("compress_threshold_tokens", 15000)
-    await compress_old_memories("group", user_qq, group_id, threshold)
+    schedule_memory_compression("group", user_qq, group_id, threshold)
 
 
 # ─── 消息接收 ──────────────────────────────────────────────────────────────────
@@ -1162,11 +1322,14 @@ async def _on_message(event: MessageEvent):
     text = _extract_text(event)
     user_qq = str(event.user_id)
     sender = event.sender
-    nickname = sender.nickname if sender else None
+    nickname = (
+        (getattr(sender, "card", None) or getattr(sender, "nickname", None))
+        if sender
+        else None
+    )
 
-    # 私聊：直接拒绝
+    # Group-only bot: do not create profiles or memories from private messages.
     if isinstance(event, PrivateMessageEvent):
-        await _update_user_profile(user_qq, nickname)
         return
 
     # 群聊处理
@@ -1176,21 +1339,93 @@ async def _on_message(event: MessageEvent):
         if not _is_allowed_group(group_id_str):
             return
 
-        await _update_user_profile(user_qq, nickname, text=text)
+        now_ts = _time.time()
+        source_message_id = _event_source_message_id(event)
+        mentioned_qqs = _extract_mentioned_qqs(event)
+        reply_to_message_id = _extract_reply_message_id(event)
+        mentions_bot = _is_mentioned(event, state.bot_qq_id)
+        called_bot = _is_called(text)
+        at_text = _extract_at_text(event, state.bot_qq_id)
+        text_at = _is_text_at_mention(event, state.bot_qq_id)
+        to_me = getattr(event, "to_me", False)
+        should_respond = bool(mentions_bot or called_bot or text_at or to_me)
 
-        state.group_last_active[group_id_str] = _time.time()
+        message_text, carried_from_previous = _resolve_message_text(
+            group_id=group_id_str,
+            user_qq=user_qq,
+            source_message_id=source_message_id,
+            text=text,
+            at_text=at_text,
+            should_respond=should_respond,
+            now=now_ts,
+        )
+        other_mentions = [
+            qq for qq in mentioned_qqs if qq != str(state.bot_qq_id)
+        ]
+        if other_mentions:
+            async with await get_session() as session:
+                mention_names = await get_user_display_names(session, other_mentions)
+            for mentioned_qq, display_name in mention_names.items():
+                message_text = message_text.replace(
+                    f"@{mentioned_qq}",
+                    f"@{display_name}",
+                )
+
+        message_id, created = await store_inbound_memory(
+            group_id=group_id_str,
+            source_message_id=source_message_id,
+            user_qq=user_qq,
+            nickname=nickname,
+            content=message_text,
+            profile_learner=_learn_profile_traits,
+        )
+        if not created:
+            logger.info(
+                "Ignored replayed group event: group=%s message=%s",
+                group_id_str,
+                source_message_id,
+            )
+            return
+
+        quoted_context, quoted_user_qq = await _resolve_reply_context(
+            bot,
+            group_id=group_id_str,
+            reply_to_message_id=reply_to_message_id,
+        )
+        contextual_text = message_text
+        if carried_from_previous:
+            contextual_text = f"[承接该成员上一条消息]\n{contextual_text}"
+        if quoted_context:
+            contextual_text = f"{quoted_context}\n{contextual_text}"
+        if message_id is not None and contextual_text != message_text:
+            async with await get_session() as session:
+                await update_message_content(
+                    session,
+                    message_id,
+                    content=contextual_text,
+                )
+                await session.commit()
+
+        state.group_last_active[group_id_str] = now_ts
         state.record_group_message(group_id_str, now=state.group_last_active[group_id_str])
         state.record_recent_group_text(
             group_id_str,
             user_qq=user_qq,
             nickname=nickname,
-            text=text,
+            text=contextual_text,
+            source_message_id=source_message_id,
+            mentioned_qqs=mentioned_qqs,
+            reply_to_message_id=reply_to_message_id,
+            carried_from_previous=carried_from_previous,
             now=state.group_last_active[group_id_str],
         )
         feedback_outcome = state.observe_proactive_join_feedback(
             group_id_str,
             user_qq=user_qq,
             bot_qq=state.bot_qq_id,
+            text=contextual_text,
+            mentions_bot=should_respond,
+            reply_to_message_id=reply_to_message_id,
             now=state.group_last_active[group_id_str],
         )
         if feedback_outcome:
@@ -1200,6 +1435,9 @@ async def _on_message(event: MessageEvent):
                 feedback_outcome,
                 state.proactive_join_probability_multiplier(group_id_str),
             )
+        from .runtime_state import schedule_persist
+
+        schedule_persist()
 
         # ── 自动戳戳 ──
 
@@ -1263,13 +1501,6 @@ async def _on_message(event: MessageEvent):
                     pass
             asyncio.create_task(_do_general_poke())
 
-        mentions_bot = _is_mentioned(event, state.bot_qq_id)
-        called_bot = _is_called(text)
-        at_text = _extract_at_text(event, state.bot_qq_id)
-        text_at = _is_text_at_mention(event, state.bot_qq_id)
-        to_me = getattr(event, "to_me", False)
-        should_respond = mentions_bot or called_bot or text_at or to_me
-
         # ── 图片缓存：无论是否触发回复，都缓存有效图片 ──
         image_infos = _extract_images(event)
         if image_infos:
@@ -1288,17 +1519,17 @@ async def _on_message(event: MessageEvent):
 
         # ── 天气查询：这里只记录意图，实际 HTTP 请求放到回复处理阶段并发执行 ──
         weather_q = ""
-        weather_text = (text or at_text) if should_respond else None
+        weather_text = message_text if should_respond else None
         if weather_text:
             weather_q = _is_weather_query(weather_text) or ""
             if weather_q:
                 logger.info("[Weather] enqueued for group %s: '%s'", group_id_str, weather_q[:60])
 
         if should_respond:
-            effective_text = at_text if at_text else "[有成员@了小源]"
+            effective_text = contextual_text
 
             # 检测特殊指令模式
-            check_text = at_text if (mentions_bot or text_at or to_me) else text
+            check_text = message_text
             special_mode, special_target, _ = _detect_special_mode(check_text or "")
 
             if special_mode != "normal":
@@ -1307,7 +1538,7 @@ async def _on_message(event: MessageEvent):
                     effective_text = "[指令模式: joke] 讲一个冷笑话"
 
             # ── 智能联网搜索：将搜索文本随消息传递到 _process_messages_inner ──
-            search_text = at_text or text or ""
+            search_text = message_text
             clean_search = ""
             if search_text:
                 bot_names = get_config().get("bot", {}).get("nickname", "小源")
@@ -1328,7 +1559,7 @@ async def _on_message(event: MessageEvent):
             if not trigger_images:
                 # 检测是否在请求识图
                 img_keywords = ["图片", "图", "看图", "识图", "识别", "发的图", "这个图", "这张图", "那个图", "那张图"]
-                check_for_img = text or at_text or ""
+                check_for_img = message_text
                 if check_for_img and any(kw in check_for_img for kw in img_keywords):
                     cache = state.group_recent_images.get(group_id_str, [])
                     now = _time.time()
@@ -1349,16 +1580,34 @@ async def _on_message(event: MessageEvent):
                 else:
                     logger.warning("所有图片识别均失败")
 
-            message_id = await store_memory(
-                user_qq=user_qq, group_id=group_id_str, scene="group",
-                role="user", content=effective_text,
-                image_url=image_url_for_memory,
-                image_description=image_desc_for_memory,
-            )
+            if message_id is not None and (
+                effective_text != contextual_text
+                or image_url_for_memory
+                or image_desc_for_memory
+            ):
+                async with await get_session() as session:
+                    await update_message_content(
+                        session,
+                        message_id,
+                        content=effective_text,
+                        image_url=image_url_for_memory,
+                        image_description=image_desc_for_memory,
+                    )
+                    await session.commit()
 
             silent = get_silent_window()
-            explicit_trigger = bool(mentions_bot or text_at or to_me)
+            explicit_trigger = bool(mentions_bot or called_bot or text_at or to_me)
             fast_window = get_config().get("silent_window", {}).get("explicit_group_seconds", 0.8)
+            recent_context = state.format_recent_group_flow(
+                group_id_str,
+                limit=int(
+                    get_config()
+                    .get("proactive_join", {})
+                    .get("recent_context_messages", 8)
+                ),
+                exclude_source_message_id=source_message_id,
+                now=now_ts,
+            )
             silent.enqueue(
                 group_key(group_id_str),
                 {
@@ -1372,13 +1621,18 @@ async def _on_message(event: MessageEvent):
                     "search_text": clean_search,
                     "weather_query": weather_q,
                     "message_id": message_id,
+                    "ambient_context": recent_context,
+                    "source_message_id": source_message_id,
+                    "reply_to_message_id": reply_to_message_id,
+                    "quoted_user_qq": quoted_user_qq,
+                    "carried_from_previous": carried_from_previous,
                 },
                 is_group=True,
                 wait_seconds=fast_window if explicit_trigger else None,
             )
 
         # 复读检测
-        if text:
+        if text and not should_respond:
             repeat_text = await check_repeat(group_id_str, text)
             if repeat_text:
                 if await should_send_proactive_message(
@@ -1387,8 +1641,7 @@ async def _on_message(event: MessageEvent):
                     candidate_text=repeat_text,
                     trigger_text=text,
                 ):
-                    await bot.send_group_msg(group_id=int(group_id_str), message=repeat_text)
-                    state.record_bot_reply(group_id_str)
+                    await _send_group_reply(bot, group_id_str, repeat_text)
 
         # 主动接话 & 戳戳
         if not should_respond and text:
@@ -1488,6 +1741,7 @@ async def _on_message(event: MessageEvent):
                             recent_context = state.format_recent_group_flow(
                                 group_id_str,
                                 limit=int(join_cfg.get("recent_context_messages", 8)),
+                                exclude_source_message_id=source_message_id,
                                 now=now_ts,
                             )
                             candidate = _join_candidate_text(
@@ -1526,17 +1780,14 @@ async def _on_message(event: MessageEvent):
                                         explicit_trigger=False,
                                         proactive=True,
                                     ):
-                                        await store_memory(
-                                            user_qq=user_qq,
-                                            group_id=group_id_str,
-                                            scene="group",
-                                            role="user",
-                                            content=text,
-                                        )
-                                        await _send_group_reply(
+                                        sent_message_id = await _send_group_reply(
                                             bot, group_id_str, local_reply,
                                         )
-                                        state.mark_proactive_join_sent(group_id_str)
+                                        state.mark_proactive_join_sent(
+                                            group_id_str,
+                                            source_message_id=sent_message_id,
+                                        )
+                                        schedule_persist()
                                         proactive_join_claimed = True
                                         logger.info(
                                             "Local proactive reaction sent: group=%s action=%s score=%s",
@@ -1563,13 +1814,6 @@ async def _on_message(event: MessageEvent):
                             else:
                                 # The generation LLM is the single contextual AI gate for
                                 # generated joins and can return the internal [SILENT] marker.
-                                message_id = await store_memory(
-                                    user_qq=user_qq,
-                                    group_id=group_id_str,
-                                    scene="group",
-                                    role="user",
-                                    content=text,
-                                )
                                 get_silent_window().enqueue(
                                     group_key(group_id_str),
                                     {
@@ -1620,8 +1864,7 @@ async def _on_message(event: MessageEvent):
                     trigger_text=text,
                 ):
                     await asyncio.sleep(1)
-                    await bot.send_group_msg(group_id=int(group_id_str), message=reaction)
-                    state.record_bot_reply(group_id_str)
+                    await _send_group_reply(bot, group_id_str, reaction)
 
 
 # ─── 事件注册 ──────────────────────────────────────────────────────────────────
@@ -1663,8 +1906,7 @@ async def handle_notice(bot: Bot, event: NoticeEvent):
             return
         import random as _random
         reply = _random.choice(_POKE_REPLIES)
-        await bot.send_group_msg(group_id=gid, message=reply)
-        state.record_bot_reply(str(gid))
+        await _send_group_reply(bot, str(gid), reply)
 
 
 def setup_silent_callback():

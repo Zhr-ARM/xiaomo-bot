@@ -125,7 +125,7 @@ def plan_tools(
         plan.reason = "explicit live-info candidate"
         return plan
 
-    if _contains_any(candidate, LIVE_CUES) and len(candidate) >= 6:
+    if is_natural_candidate(candidate):
         plan.needs_search = True
         plan.search_query = candidate
         plan.search_required = False

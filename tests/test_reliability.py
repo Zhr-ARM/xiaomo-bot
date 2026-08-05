@@ -7,7 +7,14 @@ import pytest
 import nonebot
 
 nonebot.init()
-from src.plugins.xiaomo import auto_action, database, memory, weather, web_search
+from src.plugins.xiaomo import (
+    auto_action,
+    database,
+    memory,
+    vector_store,
+    weather,
+    web_search,
+)
 
 
 def _msg(content: str, created_at: float, role: str = "user", user_qq: str = "u1"):
@@ -44,6 +51,37 @@ def test_latest_user_content_uses_newest_matching_message():
     assert memory._latest_user_content(messages, "u1") == "new question"
 
 
+def test_embedding_model_uses_local_cache_before_network_download():
+    calls = []
+
+    def model_factory(model_name, **kwargs):
+        calls.append((model_name, kwargs))
+        return object()
+
+    result = vector_store._load_embedding_model("cached-model", model_factory)
+
+    assert result is not None
+    assert calls == [("cached-model", {"local_files_only": True})]
+
+
+def test_embedding_model_downloads_only_after_local_cache_miss():
+    calls = []
+
+    def model_factory(model_name, **kwargs):
+        calls.append((model_name, kwargs))
+        if kwargs.get("local_files_only"):
+            raise OSError("not cached")
+        return object()
+
+    result = vector_store._load_embedding_model("remote-model", model_factory)
+
+    assert result is not None
+    assert calls == [
+        ("remote-model", {"local_files_only": True}),
+        ("remote-model", {}),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_weather_missing_future_day_returns_friendly_message(monkeypatch):
     async def fake_fetch_raw():
@@ -55,7 +93,11 @@ async def test_weather_missing_future_day_returns_friendly_message(monkeypatch):
             ],
         }
 
+    async def fake_fetch_open_meteo_raw():
+        return None
+
     monkeypatch.setattr(weather, "_fetch_raw", fake_fetch_raw)
+    monkeypatch.setattr(weather, "_fetch_open_meteo_raw", fake_fetch_open_meteo_raw)
 
     result = await weather.query_weather("后天")
 
@@ -96,9 +138,62 @@ async def test_weather_falls_back_to_open_meteo_when_wttr_fails(monkeypatch):
     result = await weather.query_weather("今天")
 
     assert "天气数据获取失败" not in result
-    assert "Open-Meteo" in result
+    assert "成都天气" in result
     assert "26" in result
     assert "22" in result and "31" in result
+
+
+def test_weather_city_extraction_uses_default_only_when_city_is_absent(monkeypatch):
+    monkeypatch.setattr(weather, "_default_city", lambda: "成都")
+
+    assert weather.extract_city("上海明天天气怎么样") == "上海"
+    assert weather.extract_city("北京会不会下雨") == "北京"
+    assert weather.extract_city("明天天气怎么样") == "成都"
+
+
+@pytest.mark.asyncio
+async def test_weather_queries_the_requested_city_coordinates(monkeypatch):
+    calls = []
+    date_key = datetime.now(weather.CST).date().isoformat()
+
+    async def resolve(city):
+        assert city == "上海"
+        return {
+            "name": "上海",
+            "latitude": 31.23,
+            "longitude": 121.47,
+            "timezone": "Asia/Shanghai",
+        }
+
+    async def fetch(latitude, longitude, timezone_name):
+        calls.append((latitude, longitude, timezone_name))
+        return {
+            "current": {
+                "temperature_2m": 30,
+                "relative_humidity_2m": 50,
+                "apparent_temperature": 31,
+                "weather_code": 0,
+                "wind_speed_10m": 5,
+                "wind_direction_10m": 90,
+                "uv_index": 3,
+            },
+            "daily": {
+                "time": [date_key],
+                "temperature_2m_max": [32],
+                "temperature_2m_min": [25],
+                "sunrise": [f"{date_key}T05:20"],
+                "sunset": [f"{date_key}T18:45"],
+                "weather_code": [0],
+            },
+        }
+
+    monkeypatch.setattr(weather, "_resolve_location", resolve)
+    monkeypatch.setattr(weather, "_fetch_open_meteo_raw", fetch)
+
+    result = await weather.query_weather("上海今天天气")
+
+    assert calls == [(31.23, 121.47, "Asia/Shanghai")]
+    assert "上海天气" in result
 
 
 @pytest.mark.asyncio
@@ -169,6 +264,33 @@ async def test_proactive_decision_uses_ai_gate_during_day():
     assert allowed
     assert payloads[0]["candidate_text"] == "不客气"
     assert payloads[0]["trigger_text"] == "谢谢"
+
+
+@pytest.mark.asyncio
+async def test_default_proactive_gate_keeps_caller_context(monkeypatch):
+    payloads = []
+
+    async def default_decider(payload):
+        payloads.append(payload)
+        return True
+
+    async def fail_context_load(_group_id):
+        raise AssertionError("provided context must not be overwritten")
+
+    monkeypatch.setattr(auto_action, "_default_proactive_ai_decider", default_decider)
+    monkeypatch.setattr(auto_action, "_recent_group_context", fail_context_load)
+
+    allowed = await auto_action.should_send_proactive_message(
+        group_id="g-context",
+        reason="reaction",
+        candidate_text="确实",
+        trigger_text="这个有点离谱",
+        recent_context="甲：刚才在聊部署",
+        now=datetime(2026, 6, 15, 12, 0, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert allowed is True
+    assert payloads[0]["recent_context"] == "甲：刚才在聊部署"
 
 
 @pytest.mark.asyncio
