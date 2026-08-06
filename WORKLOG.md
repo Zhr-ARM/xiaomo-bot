@@ -22,10 +22,11 @@
 
 验证：
 - 最近真实 QQ GIF 经正式视觉模块识别成功，完整耗时 `16.3s`，旧现场同图耗时 `31.7s`。
-- `python -m pytest -q`：`149 passed`。
+- `python -m pytest -q`：`150 passed`。
 - `python -m ruff check src` 及本次测试文件：通过。
 - `python -m compileall -q src bot.py test_integration.py`：通过。
 - `python test_integration.py`：10 项集成烟测全部通过。
+- 11:07 实机重新启动：守护进程 PID `34296`，Bot PID `40360`，LLBot PID `32588`；OneBot V11 账号 `3115709797` 已连接，`/healthz` 与 `/readyz` 正常，向量记忆从本地缓存载入 `951` 条。
 
 ## 2026-08-06（连续对话、QQ 身份隔离与发送超时）
 
