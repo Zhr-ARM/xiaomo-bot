@@ -23,6 +23,7 @@ _FIELDS = (
     "bot_reply_times",
     "group_recent_bot_texts",
     "group_recent_texts",
+    "group_dialogue_sessions",
     "bubble_last_time",
     "bubble_attempt_last_time",
     "repeat_last_time",

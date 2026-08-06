@@ -121,7 +121,12 @@ class LLMClient:
 
     async def generate_summary(self, messages_text: str) -> str:
         """生成对话摘要（用于记忆压缩）"""
-        system = "你是一个对话摘要助手。请将以下对话压缩为简洁的摘要，保留关键信息和人物关系。"
+        system = (
+            "你是群聊记忆摘要助手。请压缩对话并保留关键信息。"
+            "QQ 号是唯一身份主键：每条涉及某个成员的事实、观点、偏好或关系都必须保留原始 QQ 号；"
+            "昵称只作显示，绝不能按同名、旧称或上下文把不同 QQ 合并。"
+            "无法确认归属的信息写成群聊公共背景，不得猜测是谁说的。"
+        )
 
         response = await self._client.chat.completions.create(
             model=self.model,

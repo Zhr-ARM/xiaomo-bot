@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from nonebot.adapters.onebot.v11 import Bot
 
 from . import state
+from .config import get_config
 
 logger = logging.getLogger("xiaomo.delivery")
+
+
+class DeliveryTimeoutError(TimeoutError):
+    """The bridge did not confirm delivery; callers must not blindly retry."""
 
 
 def _source_message_id(result: Any) -> str | None:
@@ -33,7 +39,24 @@ async def send_group_text(
     if not clean:
         raise ValueError("group text cannot be empty")
 
-    result = await bot.send_group_msg(group_id=int(group_id), message=clean)
+    timeout_seconds = max(
+        0.1,
+        float(get_config().get("delivery", {}).get("send_timeout_seconds", 12)),
+    )
+    try:
+        result = await asyncio.wait_for(
+            bot.send_group_msg(group_id=int(group_id), message=clean),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as error:
+        logger.error(
+            "Group delivery confirmation timed out: group=%s timeout=%.1fs; not retrying",
+            group_id,
+            timeout_seconds,
+        )
+        raise DeliveryTimeoutError(
+            f"group delivery was not confirmed within {timeout_seconds:.1f}s"
+        ) from error
     state.record_bot_reply(group_id, text=clean)
     from .runtime_state import schedule_persist
 

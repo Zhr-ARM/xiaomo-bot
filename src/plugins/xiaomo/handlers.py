@@ -30,6 +30,12 @@ from .database import (
     update_message_content,
 )
 from .delivery import send_group_text
+from .dialogue import (
+    ContinuationDecision,
+    build_continuation_instruction,
+    evaluate_continuation,
+    is_closing_message,
+)
 from .llm import get_llm
 from .memory import (
     build_context,
@@ -257,6 +263,8 @@ def _format_current_user_message(
         f"name: {user_display}\n"
         f"qq: {qq}\n"
         f"mode: {mode}\n"
+        "Identity rule: QQ is the unique identity key. Names are display labels only. "
+        "Never transfer memories, quotes, traits, or relationships from another QQ, even when names match.\n"
         "Important: The message below is the only current user input. "
         "Do not rename this speaker from chat history, old aliases, or other members.\n"
         "[/CURRENT_SPEAKER]\n\n"
@@ -272,7 +280,7 @@ def _select_current_message(messages: list[dict]) -> dict:
 
     def score(index: int, msg: dict) -> tuple[int, float, int]:
         value = 0
-        if msg.get("explicit_trigger"):
+        if msg.get("explicit_trigger") or msg.get("dialogue_followup"):
             value += 100
         if msg.get("mode", "normal") != "normal":
             value += 80
@@ -441,8 +449,8 @@ def _format_ambient_context_block(ambient_context: str) -> str:
         return ""
     return (
         "[RECENT_GROUP_FLOW]\n"
-        "These are the latest group messages before this ambient join. "
-        "Use them as live context, but reply to the current opening only if it still fits.\n"
+        "These are the latest group messages before the current turn. "
+        "Use them as live context and keep speaker identities separate.\n"
         f"{text}\n"
         "[/RECENT_GROUP_FLOW]"
     )
@@ -549,6 +557,8 @@ def _post_send_context_check(
     explicit_trigger: bool,
     now: float | None = None,
 ) -> tuple[bool, str]:
+    if current_msg.get("dialogue_followup"):
+        return _post_dialogue_context_check(group_id, current_msg, now=now)
     if explicit_trigger or not current_msg.get("join_instruction"):
         return True, "explicit-or-normal"
 
@@ -598,6 +608,62 @@ def _post_send_context_check(
     return True, "still relevant"
 
 
+def _post_dialogue_context_check(
+    group_id: str,
+    current_msg: dict,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """Avoid sending a generated follow-up after the live group flow moved on."""
+
+    cfg = get_config().get("conversation_followup", {}).get("post_check", {})
+    if cfg.get("enabled", True) is False:
+        return True, "disabled"
+    if now is None:
+        now = _time.time()
+    try:
+        started_at = float(current_msg.get("timestamp") or now)
+    except (TypeError, ValueError):
+        started_at = now
+
+    stale_seconds = max(1.0, float(cfg.get("stale_seconds", 45)))
+    if now - started_at > stale_seconds:
+        return False, "dialogue reply became stale"
+
+    owner = str(current_msg.get("user_qq") or "")
+    session = state.get_dialogue_session(group_id, now=now)
+    if not session or str(session.get("user_qq") or "") != owner:
+        return False, "dialogue ownership changed"
+
+    if any(
+        float(value) > started_at
+        for value in state.bot_reply_times.get(group_id, [])
+    ):
+        return False, "bot already spoke"
+
+    newer = []
+    current_source = str(current_msg.get("source_message_id") or "")
+    for item in state.group_recent_texts.get(group_id, []):
+        try:
+            item_time = float(item.get("time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if item_time <= started_at:
+            continue
+        if current_source and str(item.get("source_message_id") or "") == current_source:
+            continue
+        if str(item.get("user_qq") or "") == str(state.bot_qq_id or ""):
+            continue
+        newer.append(item)
+
+    if any(str(item.get("user_qq") or "") == owner for item in newer):
+        return False, "speaker added another message"
+    cancel_after = max(1, int(cfg.get("cancel_after_human_messages", 2)))
+    if len(newer) >= cancel_after:
+        return False, "group flow continued"
+    return True, "dialogue still current"
+
+
 async def _wait_for_natural_send_timing(
     reply: str,
     *,
@@ -621,10 +687,11 @@ async def _wait_for_natural_send_timing(
     )
     if not ok:
         logger.info(
-            "Proactive reply cancelled before send: group=%s reason=%s",
+            "Contextual reply cancelled before send: group=%s reason=%s",
             group_id, reason,
         )
-        _trace_proactive("cancelled_before_send", group_id, reason=reason)
+        if current_msg.get("join_instruction"):
+            _trace_proactive("cancelled_before_send", group_id, reason=reason)
     return ok
 
 
@@ -882,14 +949,25 @@ async def _resolve_reply_context(
             source_message_id=reply_to_message_id,
         )
         if quoted is not None:
-            names = await get_user_display_names(session, [quoted.user_qq])
-            speaker = names.get(str(quoted.user_qq or "")) or (
-                f"QQ{quoted.user_qq}" if quoted.user_qq else "小源"
+            quoted_is_bot = quoted.role == "assistant"
+            quoted_qq = (
+                str(state.bot_qq_id or get_config().get("bot", {}).get("qq_id") or "")
+                if quoted_is_bot
+                else str(quoted.user_qq or "")
+            )
+            names = await get_user_display_names(
+                session,
+                [quoted.user_qq] if quoted.user_qq else [],
+            )
+            speaker = (
+                str(get_config().get("bot", {}).get("nickname") or "小源")
+                if quoted_is_bot
+                else names.get(quoted_qq) or (f"QQ{quoted_qq}" if quoted_qq else "成员")
             )
             return (
-                f"[回复 {speaker} (QQ:{quoted.user_qq or 'bot'})]: "
+                f"[回复 {speaker} (QQ:{quoted_qq or 'bot'})]: "
                 f"{quoted.content[:300]}",
-                quoted.user_qq,
+                quoted_qq or None,
             )
 
     try:
@@ -962,6 +1040,59 @@ async def _send_group_reply(bot: Bot, group_id: str, content: str):
     return await send_group_text(bot, group_id, content)
 
 
+def _record_dialogue_delivery(
+    *,
+    group_id: str,
+    user_qq: str | None,
+    text: str,
+    source_message_id: str | None,
+    current_msg: dict,
+) -> None:
+    """Renew a delivered solicited turn without reclaiming newer ownership."""
+
+    if not user_qq:
+        return
+    dialogue_cfg = get_config().get("conversation_followup", {})
+    ttl_seconds = float(dialogue_cfg.get("timeout_seconds", 240))
+    owner = str(user_qq)
+    marked = state.mark_dialogue_bot_reply(
+        group_id,
+        user_qq=owner,
+        text=text,
+        source_message_id=source_message_id,
+        ttl_seconds=ttl_seconds,
+    )
+    if not marked:
+        active_dialogue = state.get_dialogue_session(group_id)
+        if not active_dialogue:
+            state.start_dialogue_session(
+                group_id,
+                user_qq=owner,
+                source_message_id=current_msg.get("source_message_id"),
+                origin="reply",
+                ttl_seconds=ttl_seconds,
+            )
+            state.mark_dialogue_bot_reply(
+                group_id,
+                user_qq=owner,
+                text=text,
+                source_message_id=source_message_id,
+                ttl_seconds=ttl_seconds,
+            )
+        else:
+            logger.info(
+                "Dialogue reply did not reclaim newer ownership: group=%s replied_user=%s active_user=%s",
+                group_id,
+                owner,
+                active_dialogue.get("user_qq"),
+            )
+    if current_msg.get("dialogue_close_after_reply"):
+        state.close_dialogue_session(group_id, user_qq=owner)
+    from .runtime_state import schedule_persist
+
+    schedule_persist()
+
+
 # ─── 核心处理逻辑 ──────────────────────────────────────────────────────────────
 
 
@@ -987,11 +1118,30 @@ async def _process_messages(key: str, messages: list[dict]):
         await _process_messages_inner(bot, group_id, first_msg, messages)
     except Exception:
         logger.exception("_process_messages unexpected error for group %s", group_id)
+        has_explicit = any(
+            bool(message.get("explicit_trigger")) for message in messages
+        )
+        context_only_gate = any(
+            bool(message.get("dialogue_followup") or message.get("join_instruction"))
+            for message in messages
+        )
+        if context_only_gate and not has_explicit:
+            return
         try:
-            await _send_group_reply(
+            fallback = "刚刚这边卡了一下，你再发一次试试。"
+            sent_message_id = await _send_group_reply(
                 bot, group_id,
-                "刚刚这边卡了一下，你再发一次试试。"
+                fallback,
             )
+            if has_explicit:
+                current_msg = _select_current_message(messages) or first_msg
+                _record_dialogue_delivery(
+                    group_id=group_id,
+                    user_qq=current_msg.get("user_qq"),
+                    text=fallback,
+                    source_message_id=sent_message_id,
+                    current_msg=current_msg,
+                )
         except Exception:
             pass
     finally:
@@ -1012,6 +1162,8 @@ async def _process_messages_inner(
     mode = current_msg.get("mode", "normal")
     mode_target = current_msg.get("mode_target", "")
     explicit_trigger = any(bool(m.get("explicit_trigger", False)) for m in messages)
+    dialogue_followup = bool(current_msg.get("dialogue_followup"))
+    solicited_trigger = explicit_trigger or dialogue_followup
 
     # Fetch user profile and build identity prefix
     profile = {}
@@ -1037,17 +1189,26 @@ async def _process_messages_inner(
             if target_user:
                 target_profile = await get_user_profile_summary(session, target_user.qq_id)
             else:
-                # 可能传来的是名字不是QQ号，试着按昵称查
+                # 昵称只用于查找候选；同名关联到多个 QQ 时绝不猜身份。
                 result = await session.execute(
-                    select(UserNickname).where(
+                    select(UserNickname.user_qq).where(
                         UserNickname.nickname_id == select(Nickname.id).where(
                             Nickname.name == mode_target
                         ).scalar_subquery(),
-                    ).limit(1)
+                    )
                 )
-                un_result = result.scalar_one_or_none()
-                if un_result:
-                    target_profile = await get_user_profile_summary(session, un_result.user_qq)
+                candidate_qqs = sorted({str(value) for value in result.scalars().all()})
+                if len(candidate_qqs) == 1:
+                    target_profile = await get_user_profile_summary(
+                        session,
+                        candidate_qqs[0],
+                    )
+                elif len(candidate_qqs) > 1:
+                    logger.warning(
+                        "Ambiguous nickname target ignored: name=%s qqs=%s",
+                        mode_target,
+                        candidate_qqs,
+                    )
 
     raw_text = (current_msg.get("text") or "").strip()
     batch_context = _format_batch_context(messages, display_names, current_msg)
@@ -1060,18 +1221,22 @@ async def _process_messages_inner(
         current_msg=current_msg,
         raw_text=raw_text,
         batch_context=frame_context,
-        explicit_trigger=explicit_trigger,
+        explicit_trigger=solicited_trigger,
         search_query=planned_search_text,
         weather_query=planned_weather_query,
     )
     frame_instruction = build_frame_instruction(frame)
     join_instruction = (current_msg.get("join_instruction") or "").strip()
+    dialogue_instruction = (
+        current_msg.get("dialogue_instruction") or ""
+    ).strip()
     strategy_text = "\n".join(
         part
         for part in [
             batch_context or ambient_context_block or raw_text,
             frame_instruction,
             join_instruction,
+            dialogue_instruction,
         ]
         if part
     )
@@ -1115,13 +1280,16 @@ async def _process_messages_inner(
     # 夸夸/点草模式：附上目标用户画像
     llm_profile = profile
     if target_profile and target_profile.get("exists"):
-        combined_text += f"\n\n[目标成员信息]\n昵称: {target_profile.get('nickname', '未知')}\n"
+        combined_text += (
+            "\n\n[目标成员信息]\n"
+            f"QQ: {target_profile.get('qq_id', 'unknown')}（唯一身份主键）\n"
+            f"昵称: {target_profile.get('nickname', '未知')}\n"
+        )
         combined_text += f"称呼: {', '.join(target_profile.get('nicknames', []))}\n"
         combined_text += f"互动消息数: {target_profile.get('total_messages', 0)}\n"
         pdata = target_profile.get('profile', {})
         if pdata.get('topics'):
             combined_text += f"技术方向: {', '.join(pdata['topics'])}\n"
-        llm_profile = target_profile  # 用目标用户的画像驱动回复
 
     llm = get_llm()
     strategy = await decide_reply_strategy(
@@ -1131,7 +1299,7 @@ async def _process_messages_inner(
         context=context,
         user_profile=llm_profile,
         mode=mode,
-        explicit_trigger=explicit_trigger,
+        explicit_trigger=solicited_trigger,
         proactive=bool(join_instruction),
     )
     if mode != "normal" and not strategy.should_reply:
@@ -1244,6 +1412,7 @@ async def _process_messages_inner(
             ),
             frame_instruction,
             join_instruction,
+            dialogue_instruction,
             build_humanize_instruction(strategy),
             tone_instruction,
             adaptive_style_instruction,
@@ -1277,16 +1446,33 @@ async def _process_messages_inner(
                         ),
                         system_prompt=dynamic_system_prompt,
                     )
-                    if join_instruction and _is_silent_join_reply(reply):
-                        logger.info(
-                            "Proactive join declined by generation AI: group=%s action=%s",
-                            group_id, current_msg.get("join_action", ""),
-                        )
-                        _trace_proactive(
-                            "declined_by_generation",
-                            group_id,
-                            action=current_msg.get("join_action", ""),
-                        )
+                    if (
+                        join_instruction or dialogue_instruction
+                    ) and _is_silent_join_reply(reply):
+                        if dialogue_instruction:
+                            state.close_dialogue_session(
+                                group_id,
+                                user_qq=str(user_qq or ""),
+                            )
+                            from .runtime_state import schedule_persist
+
+                            schedule_persist()
+                            logger.info(
+                                "Dialogue continuation declined by generation AI: group=%s user=%s reason=%s",
+                                group_id,
+                                user_qq,
+                                current_msg.get("dialogue_reason", ""),
+                            )
+                        else:
+                            logger.info(
+                                "Proactive join declined by generation AI: group=%s action=%s",
+                                group_id, current_msg.get("join_action", ""),
+                            )
+                            _trace_proactive(
+                                "declined_by_generation",
+                                group_id,
+                                action=current_msg.get("join_action", ""),
+                            )
                         return
                     reply = post_check_reply(
                         reply,
@@ -1319,29 +1505,41 @@ async def _process_messages_inner(
                             update_group_mood(group_id, mood_result[0], mood_result[1])
                 except Exception as e:
                     logger.exception("LLM call failed")
-                    if join_instruction:
+                    if join_instruction or dialogue_instruction:
                         logger.info(
-                            "Proactive join abandoned after LLM failure: group=%s",
+                            "Context-gated reply abandoned after LLM failure: group=%s kind=%s",
                             group_id,
+                            "dialogue" if dialogue_instruction else "proactive",
                         )
-                        _trace_proactive("llm_failure", group_id)
+                        if join_instruction:
+                            _trace_proactive("llm_failure", group_id)
                         return
                     reply = "刚刚没生成出来，等几秒再发我一次。"
                     print(f"[LLM] Exception: {e}")
     except TimeoutError:
         logger.warning("LLM lock timeout for group %s", group_id)
-        if join_instruction:
+        if join_instruction or dialogue_instruction:
             logger.info(
-                "Proactive join abandoned after LLM timeout: group=%s",
+                "Context-gated reply abandoned after LLM timeout: group=%s kind=%s",
                 group_id,
+                "dialogue" if dialogue_instruction else "proactive",
             )
-            _trace_proactive("llm_timeout", group_id)
+            if join_instruction:
+                _trace_proactive("llm_timeout", group_id)
             return
         print(f"[LLM] Lock timeout for group={group_id}, sending fallback")
         try:
-            await _send_group_reply(
+            fallback = "刚刚没接上，你再发一次。"
+            sent_message_id = await _send_group_reply(
                 bot, group_id,
-                "刚刚没接上，你再发一次。"
+                fallback,
+            )
+            _record_dialogue_delivery(
+                group_id=group_id,
+                user_qq=user_qq,
+                text=fallback,
+                source_message_id=sent_message_id,
+                current_msg=current_msg,
             )
         except Exception:
             pass
@@ -1351,13 +1549,18 @@ async def _process_messages_inner(
         reply,
         group_id=group_id,
         current_msg=current_msg,
-        explicit_trigger=explicit_trigger,
+        explicit_trigger=solicited_trigger,
         proactive=bool(join_instruction),
     ):
         return
 
     try:
         sent_message_id = await _send_group_reply(bot, group_id, reply)
+    except Exception:
+        logger.exception("Reply delivery failed: group=%s", group_id)
+        return
+
+    try:
         if join_instruction:
             state.mark_proactive_join_sent(
                 group_id,
@@ -1369,9 +1572,20 @@ async def _process_messages_inner(
                 action=current_msg.get("join_action", ""),
                 chars=len(reply),
             )
+        if solicited_trigger and not join_instruction and user_qq:
+            _record_dialogue_delivery(
+                group_id=group_id,
+                user_qq=str(user_qq),
+                text=reply,
+                source_message_id=sent_message_id,
+                current_msg=current_msg,
+            )
         logger.info("Reply sent: group=%s chars=%d", group_id, len(reply))
     except Exception:
-        logger.exception("Reply delivery failed: group=%s", group_id)
+        logger.exception(
+            "Reply delivered but post-send state update failed: group=%s",
+            group_id,
+        )
 
     threshold = get_config().get("memory", {}).get("compress_threshold_tokens", 15000)
     schedule_memory_compression("group", user_qq, group_id, threshold)
@@ -1416,7 +1630,7 @@ async def _on_message(event: MessageEvent):
         at_text = _extract_at_text(event, state.bot_qq_id)
         text_at = _is_text_at_mention(event, state.bot_qq_id)
         to_me = getattr(event, "to_me", False)
-        should_respond = bool(mentions_bot or called_bot or text_at or to_me)
+        explicit_trigger = bool(mentions_bot or called_bot or text_at or to_me)
 
         message_text, carried_from_previous = _resolve_message_text(
             group_id=group_id_str,
@@ -1424,7 +1638,7 @@ async def _on_message(event: MessageEvent):
             source_message_id=source_message_id,
             text=text,
             at_text=at_text,
-            should_respond=should_respond,
+            should_respond=explicit_trigger,
             now=now_ts,
         )
         other_mentions = [
@@ -1460,6 +1674,64 @@ async def _on_message(event: MessageEvent):
             group_id=group_id_str,
             reply_to_message_id=reply_to_message_id,
         )
+        dialogue_cfg = get_config().get("conversation_followup", {})
+        followup_decision = ContinuationDecision(False, "explicit-trigger")
+        if not explicit_trigger:
+            followup_decision = evaluate_continuation(
+                group_id=group_id_str,
+                user_qq=user_qq,
+                text=message_text,
+                bot_qq=state.bot_qq_id,
+                mentioned_qqs=mentioned_qqs,
+                reply_to_message_id=reply_to_message_id,
+                quoted_user_qq=quoted_user_qq,
+                source_message_id=source_message_id,
+                now=now_ts,
+                config=dialogue_cfg,
+            )
+        dialogue_followup = followup_decision.candidate
+        should_respond = explicit_trigger or dialogue_followup
+        ttl_seconds = float(dialogue_cfg.get("timeout_seconds", 240))
+        if explicit_trigger:
+            state.start_dialogue_session(
+                group_id_str,
+                user_qq=user_qq,
+                source_message_id=source_message_id,
+                origin="explicit",
+                now=now_ts,
+                ttl_seconds=ttl_seconds,
+            )
+        elif dialogue_followup:
+            active_dialogue = state.get_dialogue_session(group_id_str, now=now_ts)
+            if (
+                followup_decision.direct_reply
+                and (
+                    not active_dialogue
+                    or str(active_dialogue.get("user_qq") or "") != user_qq
+                )
+            ):
+                state.start_dialogue_session(
+                    group_id_str,
+                    user_qq=user_qq,
+                    source_message_id=source_message_id,
+                    origin="direct_reply",
+                    now=now_ts,
+                    ttl_seconds=ttl_seconds,
+                )
+            state.mark_dialogue_user_turn(
+                group_id_str,
+                user_qq=user_qq,
+                now=now_ts,
+                ttl_seconds=ttl_seconds,
+            )
+            logger.info(
+                "Dialogue continuation candidate: group=%s user=%s reason=%s elapsed=%.1fs intervening=%d",
+                group_id_str,
+                user_qq,
+                followup_decision.reason,
+                followup_decision.elapsed_seconds,
+                followup_decision.intervening_humans,
+            )
         contextual_text = message_text
         if carried_from_previous:
             contextual_text = f"[承接该成员上一条消息]\n{contextual_text}"
@@ -1492,7 +1764,7 @@ async def _on_message(event: MessageEvent):
             user_qq=user_qq,
             bot_qq=state.bot_qq_id,
             text=contextual_text,
-            mentions_bot=should_respond,
+            mentions_bot=explicit_trigger,
             reply_to_message_id=reply_to_message_id,
             now=state.group_last_active[group_id_str],
         )
@@ -1664,14 +1936,17 @@ async def _on_message(event: MessageEvent):
                     await session.commit()
 
             silent = get_silent_window()
-            explicit_trigger = bool(mentions_bot or called_bot or text_at or to_me)
             fast_window = get_config().get("silent_window", {}).get("explicit_group_seconds", 0.8)
+            followup_window = float(dialogue_cfg.get("window_seconds", 0.9))
             recent_context = state.format_recent_group_flow(
                 group_id_str,
                 limit=int(
-                    get_config()
-                    .get("proactive_join", {})
-                    .get("recent_context_messages", 8)
+                    dialogue_cfg.get(
+                        "recent_context_messages",
+                        get_config()
+                        .get("proactive_join", {})
+                        .get("recent_context_messages", 8),
+                    )
                 ),
                 exclude_source_message_id=source_message_id,
                 now=now_ts,
@@ -1686,6 +1961,16 @@ async def _on_message(event: MessageEvent):
                     "mode": special_mode,
                     "mode_target": special_target,
                     "explicit_trigger": explicit_trigger,
+                    "dialogue_followup": dialogue_followup,
+                    "dialogue_instruction": build_continuation_instruction(
+                        followup_decision
+                    ),
+                    "dialogue_reason": followup_decision.reason,
+                    "dialogue_close_after_reply": (
+                        followup_decision.close_after_reply
+                        if dialogue_followup
+                        else is_closing_message(message_text)
+                    ),
                     "search_text": clean_search,
                     "weather_query": weather_q,
                     "message_id": message_id,
@@ -1696,7 +1981,11 @@ async def _on_message(event: MessageEvent):
                     "carried_from_previous": carried_from_previous,
                 },
                 is_group=True,
-                wait_seconds=fast_window if explicit_trigger else None,
+                wait_seconds=(
+                    fast_window
+                    if explicit_trigger
+                    else followup_window if dialogue_followup else None
+                ),
             )
 
         # 复读检测

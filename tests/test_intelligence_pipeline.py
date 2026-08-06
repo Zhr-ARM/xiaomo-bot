@@ -32,6 +32,28 @@ def test_batch_current_message_prefers_latest_explicit_trigger():
     assert handlers._select_search_text(messages, current) == "搜索 Python 最新版本"
 
 
+def test_batch_current_message_uses_latest_same_user_followup_after_at():
+    messages = [
+        {
+            "user_qq": "u1",
+            "text": "小源，帮我看一下",
+            "timestamp": 1,
+            "explicit_trigger": True,
+        },
+        {
+            "user_qq": "u1",
+            "text": "报错是 connection refused",
+            "timestamp": 2,
+            "explicit_trigger": False,
+            "dialogue_followup": True,
+        },
+    ]
+
+    current = handlers._select_current_message(messages)
+
+    assert current["text"] == "报错是 connection refused"
+
+
 def test_batch_context_keeps_speakers_separate():
     messages = [
         {"user_qq": "u1", "text": "天照命发的 sb", "timestamp": 1},
@@ -199,6 +221,54 @@ def test_post_send_context_check_cancels_when_humans_continue(monkeypatch):
     assert reason == "humans continued"
 
 
+def test_dialogue_post_check_waits_for_speakers_newer_message(monkeypatch):
+    from src.plugins.xiaomo import state
+
+    state.group_recent_texts.clear()
+    state.group_dialogue_sessions.clear()
+    state.bot_reply_times.clear()
+    state.bot_qq_id = "bot"
+    monkeypatch.setattr(
+        handlers,
+        "get_config",
+        lambda: {
+            "conversation_followup": {
+                "post_check": {
+                    "enabled": True,
+                    "stale_seconds": 45,
+                    "cancel_after_human_messages": 2,
+                }
+            }
+        },
+    )
+    state.start_dialogue_session("g1", user_qq="u1", now=100.0, ttl_seconds=240)
+    state.mark_dialogue_bot_reply("g1", user_qq="u1", now=102.0, ttl_seconds=240)
+    state.record_recent_group_text(
+        "g1",
+        user_qq="u1",
+        nickname="A",
+        text="等等，我再补充一句",
+        source_message_id="newer",
+        now=110.0,
+    )
+
+    ok, reason = handlers._post_send_context_check(
+        "g1",
+        {
+            "timestamp": 105.0,
+            "source_message_id": "current",
+            "user_qq": "u1",
+            "dialogue_followup": True,
+        },
+        explicit_trigger=True,
+        now=112.0,
+    )
+
+    assert ok is False
+    assert reason == "speaker added another message"
+    state.group_dialogue_sessions.clear()
+
+
 def test_plain_text_at_only_triggers_for_bot(monkeypatch):
     class Segment:
         type = "text"
@@ -296,7 +366,7 @@ async def test_context_excludes_current_message_and_loads_group_names(monkeypatc
         await memory.store_memory("u1", "g1", "group", "user", "上一条正常历史")
         current_id = await memory.store_memory("u2", "g1", "group", "user", "当前问题不该重复进历史")
 
-        context, _meta, history = await memory.build_context(
+        context, meta, history = await memory.build_context(
             scene="group",
             user_qq="u2",
             group_id="g1",
@@ -305,9 +375,10 @@ async def test_context_excludes_current_message_and_loads_group_names(monkeypatc
         )
 
         joined_history = "\n".join(item["content"] for item in history)
-        assert "[天照命]: 上一条正常历史" in joined_history
+        assert "[天照命 (QQ:u1)]: 上一条正常历史" in joined_history
         assert "当前问题不该重复进历史" not in joined_history
         assert "当前问题不该重复进历史" not in context
+        assert meta["identity_qq"] == "u2"
     finally:
         await database.close_database()
 
@@ -325,3 +396,37 @@ async def test_vector_delete_messages_removes_ids(monkeypatch):
     await vector_store.delete_messages([1, 2, 3])
 
     assert deleted == ["1", "2", "3"]
+
+
+def test_vector_search_filters_semantic_memory_by_speaker_qq(monkeypatch):
+    captured = {}
+
+    class FakeCollection:
+        def query(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "ids": [["1"]],
+                "documents": [["u1 的历史"]],
+                "metadatas": [[{
+                    "user_qq": "u1",
+                    "group_id": "g1",
+                    "created_at": 100.0,
+                }]],
+                "distances": [[0.1]],
+            }
+
+    monkeypatch.setattr(vector_store, "_collection", FakeCollection())
+    monkeypatch.setattr(vector_store, "_embed", lambda _texts: [[0.1, 0.2]])
+
+    hits = vector_store._search_similar_sync(
+        "历史",
+        scene="group",
+        group_id="g1",
+        user_qq="u1",
+        n_results=5,
+        min_time=0,
+        max_time=0,
+    )
+
+    assert hits[0]["user_qq"] == "u1"
+    assert {"user_qq": {"$eq": "u1"}} in captured["where"]["$and"]

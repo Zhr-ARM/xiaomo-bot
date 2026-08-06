@@ -37,6 +37,10 @@ _engine = None
 _session_factory: async_sessionmaker | None = None
 
 
+class InboundIdentityConflict(RuntimeError):
+    """A transport message id was replayed with a different QQ identity."""
+
+
 async def init_database():
     global _engine, _session_factory
     if _engine is not None and _session_factory is not None:
@@ -271,6 +275,9 @@ async def save_message(
     image_url: str | None = None,
     image_description: str | None = None,
 ) -> Message:
+    if role == "user" and not str(user_qq or "").strip():
+        raise ValueError("user messages require an authoritative user_qq")
+    user_qq = str(user_qq).strip() if user_qq is not None else None
     # Ensure user exists before creating message (avoids FK constraint issues)
     if user_qq:
         user = await get_or_create_user(session, user_qq)
@@ -310,6 +317,10 @@ async def save_inbound_group_message(
     twice or inflating user statistics.
     """
 
+    user_qq = str(user_qq or "").strip()
+    if not user_qq:
+        raise ValueError("inbound group messages require user_qq")
+
     insert_result = await session.execute(
         sqlite_insert(InboundEvent)
         .values(
@@ -323,14 +334,23 @@ async def save_inbound_group_message(
     )
     if insert_result.rowcount == 0:
         existing_result = await session.execute(
-            select(Message)
+            select(Message, InboundEvent.user_qq)
             .join(InboundEvent, InboundEvent.message_id == Message.id)
             .where(
                 InboundEvent.group_id == group_id,
                 InboundEvent.source_message_id == source_message_id,
             )
         )
-        return existing_result.scalar_one_or_none(), False, None
+        existing = existing_result.one_or_none()
+        if existing is None:
+            return None, False, None
+        existing_message, existing_user_qq = existing
+        if str(existing_user_qq or "") != user_qq:
+            raise InboundIdentityConflict(
+                "same group/source message was received with different QQ ids: "
+                f"stored={existing_user_qq!s} incoming={user_qq}"
+            )
+        return existing_message, False, None
 
     user = await get_or_create_user(session, user_qq)
     if nickname and user.nickname != nickname:

@@ -5,11 +5,12 @@
 ## 功能特性
 
 - **LLM 对话** — 基于 MiMo-V2.5 API，支持自然的多轮对话
-- **记忆系统** — SQLite 消息存储 + 权重衰减 + 自动摘要压缩
-- **语义搜索** — ChromaDB 向量存储，检索历史相关讨论（BGE 中文嵌入模型）
+- **记忆系统** — SQLite 消息存储 + 权重衰减 + 自动摘要压缩，成员记忆严格按 QQ 号隔离
+- **语义搜索** — ChromaDB 向量存储，只召回当前说话人 QQ 对应的历史发言（BGE 中文嵌入模型）
 - **用户画像** — 自动记录群成员发言习惯和技术方向
 - **天气查询** — 自动识别提问中的城市，支持自然语言查询和每日定时推送
 - **静默窗口** — 聚合连续消息再回复，模拟真人聊天节奏
+- **连续对话** — 第一次 @ 或点名后可自然续聊，无需每句话重复 @；转向群友时自动收住
 - **语感自适应** — 跟随近期群聊句长，抑制重复口癖、舞台动作和习惯性反问
 - **特殊模式** — 夸夸、点草（友好吐槽）、嵌入式冷笑话
 - **视觉识别** — 支持图片描述（需配置 Vision API）
@@ -164,6 +165,7 @@ xiaomo-bot/
 │   ├── persona.py          # 人设加载 & system prompt 构建
 │   ├── llm.py              # LLM 客户端 (MiMo-V2.5 / OpenAI 兼容)
 │   ├── handlers.py         # 消息处理器（核心逻辑）
+│   ├── dialogue.py         # 短期连续对话归属与抢话保护
 │   ├── memory.py           # 记忆系统（上下文构建 & 压缩）
 │   ├── database.py         # SQLite 数据库层
 │   ├── vector_store.py     # 向量语义搜索 (ChromaDB)
@@ -220,6 +222,22 @@ silent_window:
   private_seconds: 3
   group_seconds: 5
   explicit_group_seconds: 0.8
+
+# 第一次 @ 后的自然连续对话
+conversation_followup:
+  enabled: true
+  timeout_seconds: 240
+  pending_seconds: 15
+  window_seconds: 0.9
+  max_intervening_human_messages: 2
+  post_check:
+    enabled: true
+    stale_seconds: 45
+    cancel_after_human_messages: 2
+
+# QQ 桥接发送确认超时（超时后不自动重发，避免重复消息）
+delivery:
+  send_timeout_seconds: 12
 
 # 类人化回复策略（显式 @ 或叫小源后的正式回复前置判断）
 humanize:

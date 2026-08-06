@@ -26,6 +26,10 @@ group_recent_messages: dict[str, list[str]] = {}
 # 群短期文本流：用于主动接话时理解刚刚发生的聊天，不进入长期记忆
 group_recent_texts: dict[str, list[dict]] = {}
 
+# 群短期连续对话：一次明确 @/点名后，允许同一成员自然续聊而不必每句再 @。
+# 每个群只保留一位当前对话成员，避免多人聊天时抢错话。
+group_dialogue_sessions: dict[str, dict] = {}
+
 # 复读计数器: group_id -> {text: count}
 repeat_counter: dict[str, dict[str, int]] = {}
 
@@ -140,6 +144,133 @@ def get_recent_bot_texts(
     return [str(item.get("text") or "") for item in recent[-max(1, int(limit)):]]
 
 
+def start_dialogue_session(
+    group_id: str,
+    *,
+    user_qq: str,
+    source_message_id: str | None = None,
+    origin: str = "explicit",
+    now: float | None = None,
+    ttl_seconds: float = 240.0,
+) -> dict:
+    """Open or refresh a short-lived, single-owner conversation in a group."""
+
+    if now is None:
+        now = time.time()
+    group_key = str(group_id)
+    owner = str(user_qq)
+    current = group_dialogue_sessions.get(group_key) or {}
+    same_owner = str(current.get("user_qq") or "") == owner
+    session = {
+        "user_qq": owner,
+        "origin": str(origin or "explicit"),
+        "opened_at": (
+            float(current.get("opened_at") or now) if same_owner else now
+        ),
+        "last_explicit_at": now,
+        "last_user_at": now,
+        "last_bot_at": float(current.get("last_bot_at") or 0) if same_owner else 0.0,
+        "expires_at": now + max(1.0, float(ttl_seconds)),
+        "trigger_source_message_id": str(source_message_id or ""),
+        "last_bot_source_message_id": (
+            str(current.get("last_bot_source_message_id") or "")
+            if same_owner
+            else ""
+        ),
+        "last_bot_text": (
+            str(current.get("last_bot_text") or "") if same_owner else ""
+        ),
+        "turns": int(current.get("turns") or 0) if same_owner else 0,
+        "awaiting_bot_reply": True,
+    }
+    group_dialogue_sessions[group_key] = session
+    return session
+
+
+def get_dialogue_session(
+    group_id: str,
+    *,
+    now: float | None = None,
+) -> dict | None:
+    """Return the active group dialogue, dropping it when its lease expires."""
+
+    if now is None:
+        now = time.time()
+    group_key = str(group_id)
+    session = group_dialogue_sessions.get(group_key)
+    if not session:
+        return None
+    try:
+        expires_at = float(session.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if expires_at <= now:
+        group_dialogue_sessions.pop(group_key, None)
+        return None
+    return session
+
+
+def mark_dialogue_user_turn(
+    group_id: str,
+    *,
+    user_qq: str,
+    now: float | None = None,
+    ttl_seconds: float = 240.0,
+) -> bool:
+    """Refresh a candidate continuation only when the same member owns it."""
+
+    if now is None:
+        now = time.time()
+    session = get_dialogue_session(group_id, now=now)
+    if not session or str(session.get("user_qq") or "") != str(user_qq):
+        return False
+    session["last_user_at"] = now
+    session["expires_at"] = now + max(1.0, float(ttl_seconds))
+    return True
+
+
+def mark_dialogue_bot_reply(
+    group_id: str,
+    *,
+    user_qq: str,
+    text: str = "",
+    source_message_id: str | None = None,
+    now: float | None = None,
+    ttl_seconds: float = 240.0,
+) -> bool:
+    """Renew a dialogue after the bot has actually delivered its reply."""
+
+    if now is None:
+        now = time.time()
+    session = get_dialogue_session(group_id, now=now)
+    if not session or str(session.get("user_qq") or "") != str(user_qq):
+        return False
+    session["last_bot_at"] = now
+    session["expires_at"] = now + max(1.0, float(ttl_seconds))
+    session["last_bot_source_message_id"] = str(source_message_id or "")
+    session["last_bot_text"] = (text or "").strip()[:500]
+    session["turns"] = int(session.get("turns") or 0) + 1
+    session["awaiting_bot_reply"] = False
+    return True
+
+
+def close_dialogue_session(
+    group_id: str,
+    *,
+    user_qq: str | None = None,
+) -> bool:
+    """Close the active dialogue, optionally only when its owner matches."""
+
+    group_key = str(group_id)
+    session = group_dialogue_sessions.get(group_key)
+    if not session:
+        return False
+    if user_qq is not None and str(session.get("user_qq") or "") != str(user_qq):
+        return False
+    group_dialogue_sessions.pop(group_key, None)
+    return True
+
+
 def record_recent_group_text(
     group_id: str,
     *,
@@ -207,12 +338,11 @@ def format_recent_group_flow(
         != str(exclude_source_message_id)
     ]
     for item in visible[-max(1, int(limit)):]:
-        name = item.get("nickname") or (
-            f"QQ{item.get('user_qq')}" if item.get("user_qq") else "成员"
-        )
+        qq = str(item.get("user_qq") or "")
+        name = item.get("nickname") or (f"QQ{qq}" if qq else "成员")
         text = str(item.get("text") or "").strip()
         if text:
-            lines.append(f"[{name}]: {text[:160]}")
+            lines.append(f"[{name} (QQ:{qq or 'unknown'})]: {text[:160]}")
     return "\n".join(lines)
 
 

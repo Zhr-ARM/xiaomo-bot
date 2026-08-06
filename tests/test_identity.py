@@ -33,6 +33,7 @@ def test_current_message_prompt_anchors_speaker_identity():
     assert "qq: 1458741024" in text
     assert "[CURRENT_MESSAGE][\u5929\u7167\u547d (QQ:1458741024)]: sb" in text
     assert "Do not rename this speaker" in text
+    assert "QQ is the unique identity key" in text
 
 
 def test_learn_profile_traits_extracts_topics_and_style_notes():
@@ -51,6 +52,7 @@ def test_persona_includes_member_style_notes():
     prompt = persona.build_system_prompt(
         user_profile={
             "exists": True,
+            "qq_id": "1458741024",
             "nickname": "天照命",
             "total_messages": 12,
             "profile": {
@@ -62,6 +64,7 @@ def test_persona_includes_member_style_notes():
 
     assert "感兴趣的方向：Python" in prompt
     assert "互动习惯：爱开玩笑" in prompt
+    assert "QQ 号：1458741024（唯一身份主键）" in prompt
 
 
 def test_persona_keeps_roleplay_inside_reality_boundary():
@@ -118,5 +121,39 @@ async def test_update_user_profile_learns_traits(monkeypatch, tmp_path):
         assert profile["nickname"] == "天照命"
         assert "Linux" in profile["profile"]["topics"]
         assert "遇到问题会直接求助" in profile["profile"]["style_notes"]
+    finally:
+        await database.close_database()
+
+
+@pytest.mark.asyncio
+async def test_profile_memory_never_crosses_qq_ids(monkeypatch, tmp_path):
+    await database.close_database()
+    monkeypatch.setattr(
+        database,
+        "get_config",
+        lambda: {"database_path": str(tmp_path / "isolated-profiles.db")},
+    )
+    await database.init_database()
+
+    try:
+        await handlers._update_user_profile(
+            "u1",
+            "同名成员",
+            text="Linux 部署报错了",
+        )
+        await handlers._update_user_profile(
+            "u2",
+            "同名成员",
+            text="Python 代码写完了",
+        )
+
+        async with await database.get_session() as session:
+            first = await database.get_user_profile_summary(session, "u1")
+            second = await database.get_user_profile_summary(session, "u2")
+
+        assert "Linux" in first["profile"]["topics"]
+        assert "Python" not in first["profile"]["topics"]
+        assert "Python" in second["profile"]["topics"]
+        assert "Linux" not in second["profile"]["topics"]
     finally:
         await database.close_database()

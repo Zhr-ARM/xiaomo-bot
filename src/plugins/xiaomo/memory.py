@@ -147,6 +147,16 @@ def _latest_user_content(messages: list[Message], user_qq: str | None) -> str:
     return ""
 
 
+def _speaker_label(user_qq: str | None, user_names: dict[str, str]) -> str:
+    """Render identity with QQ as the stable key and nickname as display only."""
+
+    qq = str(user_qq or "").strip()
+    if not qq:
+        return "未知成员 (QQ:unknown)"
+    name = user_names.get(qq) or f"QQ{qq}"
+    return f"{name} (QQ:{qq})"
+
+
 async def build_context(
     scene: str,
     user_qq: str | None = None,
@@ -235,17 +245,29 @@ async def build_context(
     structured_history: list[dict] = []
 
     if summaries:
-        context_parts.append("[以下是历史对话摘要]\n")
+        context_parts.append(
+            "[以下是群级历史摘要。它不是当前成员的个人画像；只有明确标注同一 QQ 的事实才能归给该成员]\n"
+        )
         for s in summaries:
-            context_parts.append(s.summary)
+            summary = str(s.summary or "").strip()
+            if scene == "group" and "QQ:" not in summary:
+                context_parts.append(
+                    "[旧摘要未保留可靠 QQ，仅可用作话题背景，禁止把其中人物信息归给当前成员]\n"
+                    f"{summary}"
+                )
+            else:
+                context_parts.append(summary)
         context_parts.append("\n[/历史摘要]\n")
 
     # 分用户记忆：当前说话人的历史发言
     if user_history:
-        context_parts.append("[以下是该成员近期在本群的发言历史]\n")
+        context_parts.append(
+            f"[以下仅是当前成员 QQ:{user_qq} 近期在本群的发言历史]\n"
+        )
         for m in reversed(user_history):
-            name = user_names.get(m.user_qq or "", f"用户{m.user_qq}" if m.user_qq else "用户")
-            context_parts.append(f"- [{name}]: {m.content[:300]}")
+            context_parts.append(
+                f"- [{_speaker_label(m.user_qq, user_names)}]: {m.content[:300]}"
+            )
         context_parts.append("\n[/成员发言历史]\n")
 
     # 向量语义搜索：查找与当前话题相似的历史消息
@@ -256,13 +278,15 @@ async def build_context(
             if latest_user_content:
                 from .vector_store import search_similar
                 # 排除最近 10 分钟的消息（已在上下文中）
-                min_age = __import__("time").time() - 600
+                recent_cutoff = time.time() - 600
                 vector_hits = await search_similar(
                     query=latest_user_content,
                     scene=scene,
                     group_id=group_id,
+                    user_qq=user_qq,
                     n_results=10,
-                    min_time=min_age,
+                    min_time=0,
+                    max_time=recent_cutoff,
                 )
                 if vector_hits:
                     missing_names = {
@@ -273,9 +297,11 @@ async def build_context(
                     if missing_names:
                         async with await get_session() as session:
                             user_names.update(await get_user_display_names(session, missing_names))
-                    context_parts.append("[以下是语义相关的历史讨论（可能有助于回答当前问题）]\n")
+                    context_parts.append(
+                        f"[以下仅是当前成员 QQ:{user_qq} 的语义相关历史发言]\n"
+                    )
                     for h in vector_hits:
-                        user_label = user_names.get(h["user_qq"], f"QQ{h['user_qq']}" if h["user_qq"] else "未知")
+                        user_label = _speaker_label(h.get("user_qq"), user_names)
                         context_parts.append(f"- [{user_label}]: {h['content'][:300]}")
                     context_parts.append("\n[/语义相关历史]\n")
         except Exception:
@@ -286,8 +312,10 @@ async def build_context(
             name = "小源"
             structured_history.append({"role": "assistant", "content": msg.content})
         elif msg.role == "user":
-            name = user_names.get(msg.user_qq or "", f"用户{msg.user_qq}" if msg.user_qq else "用户")
-            structured_history.append({"role": "user", "content": f"[{name}]: {msg.content}"})
+            name = _speaker_label(msg.user_qq, user_names)
+            structured_history.append(
+                {"role": "user", "content": f"[{name}]: {msg.content}"}
+            )
         else:
             name = "系统"
 
@@ -300,7 +328,11 @@ async def build_context(
             merged_history.append(msg)
 
     context_text = "\n".join(context_parts)
-    return context_text, {"profile": profile, "message_count": len(messages)}, merged_history
+    return context_text, {
+        "profile": profile,
+        "message_count": len(messages),
+        "identity_qq": str(user_qq or ""),
+    }, merged_history
 
 
 async def store_memory(
@@ -418,9 +450,18 @@ async def compress_old_memories(
         compress_batch = to_compress[-100:]
 
         # 构建压缩文本
+        identity_names = await get_user_display_names(
+            session,
+            {m.user_qq for m in compress_batch if m.user_qq},
+        )
+        bot_qq = str(get_config().get("bot", {}).get("qq_id") or "bot")
         compress_text_parts = []
         for m in reversed(compress_batch):
-            role_name = "用户" if m.role == "user" else "小源"
+            role_name = (
+                _speaker_label(m.user_qq, identity_names)
+                if m.role == "user"
+                else f"小源 (QQ:{bot_qq})"
+            )
             compress_text_parts.append(f"[{role_name}]: {m.content[:300]}")
         compress_text = "\n".join(compress_text_parts)
 
@@ -437,7 +478,7 @@ async def compress_old_memories(
             summary_text = "对话摘要：\n" + compress_text[:3000]
 
         compressed = ContextSummary(
-            user_qq=user_qq,
+            user_qq=user_qq if scene == "private" else None,
             group_id=group_id,
             scene=scene,
             summary=summary_text,

@@ -199,21 +199,30 @@ def _search_similar_sync(
     *,
     scene: str,
     group_id: str | None,
+    user_qq: str | None,
     n_results: int,
     min_time: float,
+    max_time: float,
 ) -> list[dict]:
     if _collection is None:
         return []
     with _store_lock:
         embedding = _embed([query])
-        where_filter = None
+        filters = []
         if scene == "group" and group_id:
-            where_filter = {
-                "$and": [
+            filters.extend(
+                [
                     {"scene": {"$eq": "group"}},
-                    {"group_id": {"$eq": group_id}},
+                    {"group_id": {"$eq": str(group_id)}},
                 ]
-            }
+            )
+        if user_qq:
+            filters.append({"user_qq": {"$eq": str(user_qq)}})
+        where_filter = None
+        if len(filters) == 1:
+            where_filter = filters[0]
+        elif filters:
+            where_filter = {"$and": filters}
         results = _collection.query(
             query_embeddings=embedding,
             n_results=n_results,
@@ -227,6 +236,8 @@ def _search_similar_sync(
             meta = results["metadatas"][0][i]
             distance = results["distances"][0][i]
             if min_time and meta.get("created_at", 0) < min_time:
+                continue
+            if max_time and meta.get("created_at", 0) > max_time:
                 continue
             hits.append(
                 {
@@ -247,6 +258,7 @@ async def search_similar(
     user_qq: str | None = None,
     n_results: int = 15,
     min_time: float = 0,
+    max_time: float = 0,
 ) -> list[dict]:
     """语义搜索相关历史消息。返回 [{"content": ..., "user_qq": ..., "created_at": ...}, ...]"""
     if _collection is None or not query.strip():
@@ -257,8 +269,10 @@ async def search_similar(
             query,
             scene=scene,
             group_id=group_id,
+            user_qq=user_qq,
             n_results=n_results,
             min_time=min_time,
+            max_time=max_time,
         )
     except Exception:
         logger.exception("Vector search failed")

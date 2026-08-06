@@ -61,10 +61,20 @@ def build_system_prompt(
     parts = [persona, time_context, format_almanac(now.date())]
 
     if memory:
-        parts.append(f"\n## 群聊记忆库\n{memory}")
+        parts.append(
+            "\n## 群聊记忆库\n"
+            "身份规则：QQ 号是成员唯一主键。静态资料里没有 QQ 号的名字只能当协会背景，"
+            "不得据此判断当前发言人是谁，也不得把资料归到同名成员身上。\n"
+            f"{memory}"
+        )
 
     if user_profile and user_profile.get("exists"):
-        p = ["\n## 当前成员"]
+        current_qq = str(user_profile.get("qq_id") or "unknown")
+        p = [
+            "\n## 当前成员",
+            f"- QQ 号：{current_qq}（唯一身份主键）",
+            "- 下列画像只属于这个 QQ；昵称相同或相似的其他成员不得继承这些记忆。",
+        ]
         if user_profile.get("nickname"):
             p.append(f"- 昵称：{user_profile['nickname']}")
         if user_profile.get("nicknames"):

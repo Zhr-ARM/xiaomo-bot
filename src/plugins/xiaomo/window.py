@@ -94,7 +94,8 @@ class SilentWindow:
             timestamp = float(message.get("timestamp") or 0)
         except (TypeError, ValueError):
             timestamp = 0.0
-        return (1 if message.get("explicit_trigger") else 0, timestamp, index)
+        solicited = message.get("explicit_trigger") or message.get("dialogue_followup")
+        return (1 if solicited else 0, timestamp, index)
 
     def _enforce_limits(self, changed_key: str) -> None:
         bucket = self._pending[changed_key]
@@ -118,7 +119,10 @@ class SilentWindow:
                 for index, queued in enumerate(messages):
                     candidates.append(
                         (
-                            1 if queued.get("explicit_trigger") else 0,
+                            1
+                            if queued.get("explicit_trigger")
+                            or queued.get("dialogue_followup")
+                            else 0,
                             float(queued.get("timestamp") or 0),
                             key,
                             index,

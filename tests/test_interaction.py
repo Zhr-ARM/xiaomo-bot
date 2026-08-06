@@ -210,8 +210,8 @@ def test_recent_group_flow_formats_live_context(monkeypatch):
 
     flow = state.format_recent_group_flow("g1", limit=2)
 
-    assert "[天照命]: 有人来聊聊这个方案吗" in flow
-    assert "[QQu2]: 我觉得有点怪" in flow
+    assert "[天照命 (QQ:u1)]: 有人来聊聊这个方案吗" in flow
+    assert "[QQu2 (QQ:u2)]: 我觉得有点怪" in flow
 
 
 def test_recent_group_flow_drops_expired_messages(monkeypatch):

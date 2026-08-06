@@ -81,6 +81,10 @@ human_timing:
   explicit_max_seconds: 0.8
   proactive_max_seconds: 1.2
 
+# QQ 桥接未在时限内确认发送时立即释放回复管线；结果不确定，因此不会自动重发。
+delivery:
+  send_timeout_seconds: 12
+
 # 类人化回复策略（显式 @ 或叫小源后的正式回复前置判断）
 humanize:
   enabled: true
@@ -107,6 +111,20 @@ silent_window:
   private_seconds: 3
   group_seconds: 5
   explicit_group_seconds: 0.8    # 明确 @/to_me 的快速响应窗口；普通群聊仍保留 5 秒合并
+
+# 连续对话：第一次 @/点名建立会话，后续同一成员可不重复 @。
+# 本地规则只筛候选，正式回复模型仍会结合群聊背景判断是在对小源还是对群友说话。
+conversation_followup:
+  enabled: true
+  timeout_seconds: 240
+  pending_seconds: 15
+  window_seconds: 0.9
+  recent_context_messages: 10
+  max_intervening_human_messages: 2
+  post_check:
+    enabled: true
+    stale_seconds: 45
+    cancel_after_human_messages: 2
 
 auto_action:
   bubble_inactive_minutes: 30
