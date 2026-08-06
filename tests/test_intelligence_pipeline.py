@@ -78,6 +78,73 @@ def test_batch_context_keeps_speakers_separate():
     assert "[CURRENT_MESSAGE][天照命 (QQ:u1)]: 天照命发的 sb" in prompt
 
 
+def test_batch_images_follow_latest_message_from_same_qq_only():
+    own_image = {
+        "url": "https://example.test/own.gif",
+        "file": "own.gif",
+        "user_qq": "u1",
+    }
+    messages = [
+        {
+            "user_qq": "u1",
+            "text": "[非文本群消息]",
+            "timestamp": 1,
+            "dialogue_followup": True,
+            "images": [own_image],
+        },
+        {
+            "user_qq": "u2",
+            "text": "这是我的图",
+            "timestamp": 2,
+            "images": [{"url": "https://example.test/other.jpg"}],
+        },
+        {
+            "user_qq": "u1",
+            "text": "这个表情也太真实了",
+            "timestamp": 3,
+            "dialogue_followup": True,
+        },
+    ]
+
+    current = handlers._select_current_message(messages)
+
+    assert current["text"] == "这个表情也太真实了"
+    assert handlers._select_batch_images(messages, current) == [own_image]
+
+
+def test_batch_context_renders_image_instead_of_non_text_placeholder():
+    message = {
+        "user_qq": "u1",
+        "text": "[非文本群消息]",
+        "images": [{"url": "https://example.test/a.gif"}],
+    }
+
+    context = handlers._format_batch_context(
+        [message, {"user_qq": "u1", "text": "看这个"}],
+        {"u1": "天照命"},
+        message,
+    )
+
+    assert "[发送了1张图片]" in context
+    assert "[非文本群消息]" not in context
+
+
+def test_attached_image_forces_image_tool_plan_without_text_cue():
+    frame = handlers.build_conversation_frame(
+        current_msg={
+            "user_qq": "u1",
+            "text": "[非文本群消息]",
+            "images": [{"url": "https://example.test/a.gif"}],
+        },
+        raw_text="[非文本群消息]",
+        explicit_trigger=True,
+    )
+
+    assert frame.scene == "image_question"
+    assert frame.tool_plan is not None
+    assert frame.tool_plan.needs_image is True
+
+
 def test_ambient_context_block_is_available_for_proactive_join():
     block = handlers._format_ambient_context_block(
         "[天照命]: 有人来聊聊这个方案吗\n[其他人]: 感觉可以"

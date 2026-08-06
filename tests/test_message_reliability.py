@@ -23,6 +23,7 @@ def _group_event(
     user_id: int,
     text: str = "",
     at_bot: bool = False,
+    image_url: str = "",
     card: str = "群名片",
 ) -> GroupMessageEvent:
     segments = []
@@ -30,6 +31,13 @@ def _group_event(
         segments.append(MessageSegment.text(text))
     if at_bot:
         segments.append(MessageSegment.at(3115709797))
+    if image_url:
+        segments.append(
+            MessageSegment(
+                "image",
+                {"file": "test.gif", "url": image_url},
+            )
+        )
     return GroupMessageEvent(
         time=1,
         self_id=3115709797,
@@ -258,6 +266,73 @@ async def test_initial_at_opens_fast_no_mention_followup(monkeypatch, tmp_path):
         assert "[DIALOGUE_CONTINUATION_CHECK]" in queued["dialogue_instruction"]
         assert capture.items[0][2]["wait_seconds"] == 0.02
     finally:
+        state.group_dialogue_sessions.clear()
+        await database.close_database()
+
+
+@pytest.mark.asyncio
+async def test_image_intake_enqueues_without_waiting_for_vision(monkeypatch, tmp_path):
+    await database.close_database()
+    monkeypatch.setattr(
+        database,
+        "get_config",
+        lambda: {"database_path": str(tmp_path / "image-events.db")},
+    )
+    await database.init_database()
+
+    capture = _CaptureWindow()
+    monkeypatch.setattr(handlers, "get_bot", lambda: _FakeBot())
+    monkeypatch.setattr(handlers, "get_silent_window", lambda: capture)
+    monkeypatch.setattr(handlers, "_is_allowed_group", lambda _group_id: True)
+    monkeypatch.setattr(
+        handlers,
+        "get_config",
+        lambda: {
+            "bot": {"nickname": "小源", "qq_id": "3115709797"},
+            "silent_window": {"explicit_group_seconds": 0.01},
+            "conversation_followup": {"enabled": True},
+            "proactive_join": {"enabled": False, "recent_context_messages": 8},
+            "reactions": {"triggers": {}},
+            "poke_everyone_cooldown_minutes": 0,
+        },
+    )
+
+    async def initialized():
+        return None
+
+    async def vision_must_not_run_at_intake(*_args, **_kwargs):
+        raise AssertionError("vision belongs in the queued reply pipeline")
+
+    monkeypatch.setattr(handlers, "_ensure_init", initialized)
+    monkeypatch.setattr(handlers, "_recognize_images", vision_must_not_run_at_intake)
+    from src.plugins.xiaomo import runtime_state
+
+    monkeypatch.setattr(runtime_state, "schedule_persist", lambda *_args, **_kwargs: None)
+    state.group_recent_images.clear()
+    state.group_recent_texts.clear()
+    state.group_dialogue_sessions.clear()
+    state.group_message_times.clear()
+    state.bot_reply_times.clear()
+    state.bot_qq_id = "3115709797"
+
+    try:
+        await handlers._on_message(
+            _group_event(
+                message_id=701,
+                user_id=26,
+                at_bot=True,
+                image_url="https://example.test/reaction.gif",
+            )
+        )
+
+        assert len(capture.items) == 1
+        queued = capture.items[0][1]
+        assert queued["explicit_trigger"] is True
+        assert queued["images"][0]["url"] == "https://example.test/reaction.gif"
+        assert queued["images"][0]["user_qq"] == "26"
+        assert queued["images"][0]["message_id"] is not None
+    finally:
+        state.group_recent_images.clear()
         state.group_dialogue_sessions.clear()
         await database.close_database()
 

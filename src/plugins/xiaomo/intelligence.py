@@ -168,6 +168,14 @@ def build_conversation_frame(
         existing_search_query=search_query,
         existing_weather_query=weather_query,
     )
+    has_images = bool(current_msg.get("images"))
+    if has_images:
+        tool_plan.needs_image = True
+        if scene in {"empty", "casual_banter", "casual_question", "group_flow"}:
+            scene = "image_question"
+        if tool_plan.reason == "default":
+            tool_plan.reason = "image attached to current turn"
+        tool_plan.confidence = max(tool_plan.confidence, 0.95)
 
     tone = "brief"
     goal = "像群友一样自然接一句，别抢话。"
@@ -191,7 +199,7 @@ def build_conversation_frame(
     elif scene == "image_question":
         tone = "observational"
         goal = "基于图片内容回答，看不清就说明限制。"
-        max_chars = 380
+        max_chars = 240
     elif scene in {"casual_banter", "casual_question"}:
         tone = "playful_brief"
         goal = "短短接住，可以反问，别展开成长答案。"

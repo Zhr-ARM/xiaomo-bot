@@ -29,7 +29,13 @@ vision:
   anthropic_base: "${VISION_ANTHROPIC_BASE:-https://api.xiaomimimo.com/anthropic}"
   api_key: "${VISION_API_KEY:-}"
   model: "${VISION_MODEL:-mimo-v2.5}"
-  max_tokens: 1024
+  max_tokens: 384
+  temperature: 0.1
+  timeout_seconds: 25
+  download_timeout_seconds: 12
+  total_timeout_seconds: 30
+  max_retries: 0
+  max_images_per_turn: 2
   max_image_size_mb: 20
 
 weather:

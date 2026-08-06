@@ -1,8 +1,4 @@
-"""小源 QQ 机器人 - 图片识别模块 (MiMo-V2.5 Vision)
-
-使用 MiMo-V2.5 的多模态能力识别图片内容，
-以猫娘视角生成简短有趣的描述，融入对话上下文。
-"""
+"""小源 QQ 机器人 - 图片识别模块 (MiMo-V2.5 Vision)."""
 from __future__ import annotations
 
 import base64
@@ -19,14 +15,14 @@ from .config import get_config
 
 logger = logging.getLogger("xiaomo.vision")
 
-# 默认视觉识别提示词 — 猫娘视角，简短有趣
+# 视觉层只负责提取事实，语气和角色由最终回复模型统一处理。
 DEFAULT_VISION_PROMPT = (
-    "请以一只叫「小源」的开源协会猫娘的视角描述这张图片的内容。"
-    "用中文，简短有趣，控制在2-3句话。"
-    "如果图片中有文字或代码，请概述其主要内容。"
-    "如果图片是表情包/梗图，请用幽默的方式解读。"
-    "不要使用「图片中」「图中」等客观表述——要像你真的看到了一样。"
+    "准确识别这张图片，直接用中文概括可见内容。"
+    "有文字就读出关键文字，有代码或报错就说明关键问题。"
+    "只写1到2句，不自我介绍、不角色扮演、不添加看不到的信息。"
 )
+
+_client: AsyncOpenAI | None = None
 
 
 def _get_vision_config() -> dict:
@@ -34,15 +30,25 @@ def _get_vision_config() -> dict:
 
 
 def _get_client() -> AsyncOpenAI:
+    global _client
+    if _client is not None:
+        return _client
     config = _get_vision_config()
     api_key = config.get("api_key") or os.getenv("VISION_API_KEY", "")
     base_url = config.get("api_base", "https://api.xiaomimimo.com/v1")
-    return AsyncOpenAI(api_key=api_key, base_url=base_url)
+    _client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=float(config.get("timeout_seconds", 25)),
+        max_retries=int(config.get("max_retries", 0)),
+    )
+    return _client
 
 
 async def _download_image(url: str) -> bytes:
-    """下载图片，带超时和重试"""
-    async with httpx.AsyncClient(timeout=30) as client:
+    """下载图片。"""
+    timeout = float(_get_vision_config().get("download_timeout_seconds", 12))
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         return resp.content
@@ -52,14 +58,35 @@ def _encode_image(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
 
-async def _call_vision_api(image_base64: str, prompt: str) -> Optional[str]:
+def _detect_image_mime(data: bytes) -> str:
+    """Detect common image formats from magic bytes instead of trusting QQ suffixes."""
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    logger.warning("无法从文件头判断图片格式，按 JPEG 兼容处理")
+    return "image/jpeg"
+
+
+async def _call_vision_api(
+    image_base64: str,
+    prompt: str,
+    *,
+    mime_type: str = "image/jpeg",
+) -> Optional[str]:
     """调用 MiMo-V2.5 Vision API"""
     config = _get_vision_config()
     model = config.get("model", "mimo-v2.5")
-    max_tokens = config.get("max_tokens", 1024)
+    max_tokens = int(config.get("max_tokens", 384))
 
     client = _get_client()
-    t0 = time.time()
+    t0 = time.perf_counter()
     response = await client.chat.completions.create(
         model=model,
         messages=[
@@ -69,15 +96,23 @@ async def _call_vision_api(image_base64: str, prompt: str) -> Optional[str]:
                     {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
+                        "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},
                     },
                 ],
             }
         ],
         max_tokens=max_tokens,
+        temperature=float(config.get("temperature", 0.1)),
     )
-    elapsed = time.time() - t0
-    logger.info("Vision API 调用完成，耗时 %.1fs", elapsed)
+    elapsed = time.perf_counter() - t0
+    finish_reason = response.choices[0].finish_reason
+    logger.info(
+        "Vision API 调用完成，耗时 %.1fs，finish=%s",
+        elapsed,
+        finish_reason,
+    )
+    if finish_reason == "length":
+        logger.warning("Vision API 输出达到 token 上限")
     return response.choices[0].message.content
 
 
@@ -110,8 +145,9 @@ async def describe_image_from_url(
             return f"[图片过大 ({size_mb:.1f}MB)]"
 
         base64_image = _encode_image(image_data)
+        mime_type = _detect_image_mime(image_data)
         prompt = custom_prompt or DEFAULT_VISION_PROMPT
-        result = await _call_vision_api(base64_image, prompt)
+        result = await _call_vision_api(base64_image, prompt, mime_type=mime_type)
 
         if result:
             logger.info("图片识别成功: %s", result[:80])
@@ -128,7 +164,7 @@ async def describe_image_from_url(
         return "[图片下载失败]"
     except Exception as e:
         logger.exception("图片识别异常: %s", e)
-        return "[图片识别暂不可用，小源正在努力学习看图喵~]"
+        return "[图片识别暂不可用]"
 
 
 async def describe_image_from_file(
@@ -192,8 +228,9 @@ async def describe_image_from_bytes(
             return "[图片数据无效]"
 
         base64_image = _encode_image(image_data)
+        mime_type = _detect_image_mime(image_data)
         prompt = custom_prompt or DEFAULT_VISION_PROMPT
-        result = await _call_vision_api(base64_image, prompt)
+        result = await _call_vision_api(base64_image, prompt, mime_type=mime_type)
 
         if result:
             logger.info("图片识别成功: %s", result[:80])
@@ -203,4 +240,4 @@ async def describe_image_from_bytes(
 
     except Exception as e:
         logger.exception("图片识别异常: %s", e)
-        return "[图片识别暂不可用，小源正在努力学习看图喵~]"
+        return "[图片识别暂不可用]"

@@ -28,6 +28,7 @@ from .database import (
 logger = logging.getLogger("xiaomo.memory")
 _compression_tasks: dict[str, asyncio.Task] = {}
 _vector_index_tasks: set[asyncio.Task] = set()
+_NON_SEMANTIC_PLACEHOLDERS = {"[非文本群消息]", "[有成员@了小源]"}
 
 
 def _schedule_vector_index(**kwargs) -> None:
@@ -53,6 +54,28 @@ def _schedule_vector_index(**kwargs) -> None:
             )
 
     task.add_done_callback(_finished)
+
+
+def schedule_vector_refresh(
+    *,
+    message_id: int,
+    content: str,
+    user_qq: str | None,
+    group_id: str | None,
+    scene: str,
+    created_at: float,
+) -> None:
+    """Upsert a message after asynchronous enrichment such as vision recognition."""
+    if not content.strip() or content.strip() in _NON_SEMANTIC_PLACEHOLDERS:
+        return
+    _schedule_vector_index(
+        message_id=message_id,
+        content=content,
+        user_qq=user_qq,
+        group_id=group_id,
+        scene=scene,
+        created_at=created_at,
+    )
 
 
 # ─── Weight Decay ─────────────────────────────────────────────────────────────
@@ -359,7 +382,11 @@ async def store_memory(
         await session.commit()
 
     # 同步写向量库（用户消息才需要语义搜索）
-    if role == "user" and content.strip():
+    if (
+        role == "user"
+        and content.strip()
+        and content.strip() not in _NON_SEMANTIC_PLACEHOLDERS
+    ):
         _schedule_vector_index(
             message_id=msg.id,
             content=content,
@@ -401,7 +428,12 @@ async def store_inbound_memory(
                 user.set_profile(learned_profile)
         await session.commit()
 
-    if created and message is not None and content.strip():
+    if (
+        created
+        and message is not None
+        and content.strip()
+        and content.strip() not in _NON_SEMANTIC_PLACEHOLDERS
+    ):
         _schedule_vector_index(
             message_id=message.id,
             content=content,

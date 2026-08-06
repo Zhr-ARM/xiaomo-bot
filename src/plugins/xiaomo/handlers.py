@@ -41,6 +41,7 @@ from .memory import (
     build_context,
     group_key,
     schedule_memory_compression,
+    schedule_vector_refresh,
     store_inbound_memory,
 )
 from .window import get_silent_window
@@ -317,6 +318,13 @@ def _format_batch_context(
         qq = str(msg.get("user_qq") or "unknown")
         name = _display_for_message(msg, display_names)
         text = (msg.get("text") or "").strip() or "[空消息]"
+        image_count = len(msg.get("images") or [])
+        if image_count:
+            image_label = f"[发送了{image_count}张图片]"
+            if text in {"[非文本群消息]", "[有成员@了小源]", "[空消息]"}:
+                text = image_label
+            else:
+                text = f"{text} {image_label}"
         marker = " <= reply target" if msg is current_msg else ""
         lines.append(f"{idx}. [{name} (QQ:{qq})]{marker}: {text}")
     return "\n".join(lines)
@@ -328,6 +336,22 @@ def _select_search_text(messages: list[dict], current_msg: dict) -> str:
 
 def _select_weather_query(messages: list[dict], current_msg: dict) -> str:
     return _select_batch_field(messages, current_msg, "weather_query")
+
+
+def _select_batch_images(messages: list[dict], current_msg: dict) -> list[dict]:
+    """Carry images only within the selected speaker's turn."""
+    current_images = list(current_msg.get("images") or [])
+    if current_images:
+        return current_images
+
+    current_user = str(current_msg.get("user_qq") or "")
+    for msg in reversed(messages):
+        if str(msg.get("user_qq") or "") != current_user:
+            continue
+        images = list(msg.get("images") or [])
+        if images:
+            return images
+    return []
 
 
 def _select_batch_field(messages: list[dict], current_msg: dict, field: str) -> str:
@@ -734,26 +758,36 @@ async def _recognize_images(
     """
     from .vision import describe_image_from_url, describe_image_from_bytes
 
-    desc_parts = []
-    first_url = None
-    first_desc = None
+    max_images = max(
+        1,
+        int(get_config().get("vision", {}).get("max_images_per_turn", 2)),
+    )
+    selected = image_infos[:max_images]
+    if len(image_infos) > max_images:
+        logger.info(
+            "[IMAGE] 本轮收到 %d 张图，只识别前 %d 张",
+            len(image_infos),
+            max_images,
+        )
 
-    for info in image_infos:
-        url = info["url"]
-        file_id = info["file"]
+    async def recognize_one(info: dict) -> tuple[str | None, str]:
+        url = str(info.get("url") or "")
+        file_id = str(info.get("file") or "")
+        cached_description = str(info.get("description") or "").strip()
+        if cached_description:
+            logger.info("[IMAGE] 复用当前 QQ 最近图片的识别结果")
+            return cached_description, url or file_id
         result = None
 
-        # 方式 1: 直接下载 HTTP(S) URL
         if url:
             logger.info("[IMAGE] URL 下载: %s", url[:120])
             result = await describe_image_from_url(url)
             if result and not result.startswith("[图片"):
-                logger.info("[IMAGE] URL 下载成功")
+                logger.info("[IMAGE] URL 识别成功")
             else:
-                logger.warning("[IMAGE] URL 下载失败: %s", result)
+                logger.warning("[IMAGE] URL 识别失败: %s", result)
                 result = None
 
-        # 方式 2: OneBot get_image (通过 WS 反向连接)
         if result is None and file_id:
             logger.info("[IMAGE] OneBot WS get_image: file=%s", file_id)
             try:
@@ -763,23 +797,37 @@ async def _recognize_images(
                 if image_bytes and len(image_bytes) > 100:
                     result = await describe_image_from_bytes(image_bytes)
                     if result and not result.startswith("[图片"):
-                        logger.info("[IMAGE] WS API 识别成功, %d bytes", len(image_bytes))
+                        logger.info(
+                            "[IMAGE] WS API 识别成功, %d bytes",
+                            len(image_bytes),
+                        )
                     else:
                         logger.warning("[IMAGE] WS API 识别返回: %s", result)
+                        result = None
                 else:
-                    logger.warning("[IMAGE] WS get_image 空数据, len=%d", len(image_bytes) if image_bytes else 0)
-            except Exception as e:
-                logger.exception("[IMAGE] WS get_image 异常: %s", e)
+                    logger.warning(
+                        "[IMAGE] WS get_image 空数据, len=%d",
+                        len(image_bytes) if image_bytes else 0,
+                    )
+            except Exception as exc:
+                logger.exception("[IMAGE] WS get_image 异常: %s", exc)
 
         if result and not result.startswith("[图片"):
-            desc_parts.append(f"[图片内容描述：{result}]")
-            if first_url is None:
-                first_url = url or file_id
-                first_desc = result
-        else:
-            logger.warning("[IMAGE] 跳过（识别失败）: url=%s file=%s", url, file_id)
+            return result, url or file_id
+        logger.warning("[IMAGE] 跳过（识别失败）: url=%s file=%s", url, file_id)
+        return None, url or file_id
 
-    return desc_parts, first_url, first_desc
+    results = await asyncio.gather(*(recognize_one(info) for info in selected))
+    descriptions = [result for result, _ in results if result]
+    first_result = next(
+        ((result, source) for result, source in results if result),
+        (None, None),
+    )
+    return (
+        [f"[图片内容描述：{result}]" for result in descriptions],
+        first_result[1],
+        first_result[0],
+    )
 
 
 async def _parse_get_image_response(resp) -> bytes | None:
@@ -1211,6 +1259,7 @@ async def _process_messages_inner(
                     )
 
     raw_text = (current_msg.get("text") or "").strip()
+    trigger_images = _select_batch_images(messages, current_msg)
     batch_context = _format_batch_context(messages, display_names, current_msg)
     ambient_context = (current_msg.get("ambient_context") or "").strip()
     ambient_context_block = _format_ambient_context_block(ambient_context)
@@ -1218,7 +1267,7 @@ async def _process_messages_inner(
     planned_search_text = _select_search_text(messages, current_msg)
     planned_weather_query = _select_weather_query(messages, current_msg)
     frame = build_conversation_frame(
-        current_msg=current_msg,
+        current_msg={**current_msg, "images": trigger_images},
         raw_text=raw_text,
         batch_context=frame_context,
         explicit_trigger=solicited_trigger,
@@ -1252,6 +1301,12 @@ async def _process_messages_inner(
         current_text = "来个冷笑话"
     else:
         current_text = raw_text
+    if trigger_images and current_text in {
+        "",
+        "[非文本群消息]",
+        "[有成员@了小源]",
+    }:
+        current_text = f"[发送了{len(trigger_images)}张图片]"
     combined_text = _format_current_user_message(
         user_display=user_display,
         user_qq=user_qq,
@@ -1323,12 +1378,116 @@ async def _process_messages_inner(
             )
         return
 
-    # ── 工具调用：天气和联网搜索并发执行，避免串行等待拖慢回复 ──
+    # ── 工具调用并发执行；图片也在群级回复队列内完成，避免消息入口被卡住 ──
     plan = frame.tool_plan
     weather_query = plan.weather_query if plan and plan.needs_weather else ""
     search_text = plan.search_query if plan and plan.needs_search else ""
+    vision_task = None
+    if trigger_images:
+        vision_total_timeout = float(
+            get_config().get("vision", {}).get("total_timeout_seconds", 30)
+        )
+        logger.info("[IMAGE] 回复队列开始识别 %d 张图片", len(trigger_images))
+        vision_task = asyncio.create_task(
+            asyncio.wait_for(
+                _recognize_images(trigger_images, bot),
+                timeout=vision_total_timeout,
+            )
+        )
     weather_task = asyncio.create_task(query_weather(weather_query)) if weather_query else None
     search_task = asyncio.create_task(run_smart_search_result(search_text)) if search_text else None
+
+    if vision_task:
+        desc_parts: list[str] = []
+        image_url_for_memory = None
+        image_desc_for_memory = None
+        try:
+            (
+                desc_parts,
+                image_url_for_memory,
+                image_desc_for_memory,
+            ) = await vision_task
+        except asyncio.TimeoutError:
+            logger.warning("[IMAGE] 本轮视觉识别总耗时超限")
+        except Exception:
+            logger.exception("[IMAGE] 本轮视觉识别异常")
+
+        if desc_parts:
+            combined_text = f"{combined_text}\n\n" + "\n".join(desc_parts)
+            logger.info("[IMAGE] 图片识别完成，已附加 %d 条描述", len(desc_parts))
+
+            first_info = next(
+                (
+                    info
+                    for info in trigger_images
+                    if (str(info.get("url") or info.get("file") or ""))
+                    == str(image_url_for_memory or "")
+                ),
+                trigger_images[0],
+            )
+            memory_message_id = first_info.get("message_id") or current_msg.get("message_id")
+            memory_content = str(
+                first_info.get("memory_content")
+                or current_msg.get("text")
+                or "[用户发送了图片]"
+            ).strip()
+            if memory_content in {"[非文本群消息]", "[有成员@了小源]"}:
+                memory_content = "[用户发送了图片]"
+            for desc_part in desc_parts:
+                if desc_part not in memory_content:
+                    memory_content = f"{memory_content}\n{desc_part}"
+
+            if memory_message_id is not None:
+                try:
+                    memory_message_id = int(memory_message_id)
+                    async with await get_session() as session:
+                        await update_message_content(
+                            session,
+                            memory_message_id,
+                            content=memory_content,
+                            image_url=image_url_for_memory,
+                            image_description=image_desc_for_memory,
+                        )
+                        await session.commit()
+                    schedule_vector_refresh(
+                        message_id=memory_message_id,
+                        content=memory_content,
+                        user_qq=str(first_info.get("user_qq") or user_qq or ""),
+                        group_id=group_id,
+                        scene="group",
+                        created_at=float(
+                            first_info.get("timestamp")
+                            or current_msg.get("timestamp")
+                            or _time.time()
+                        ),
+                    )
+                    for cached_image in state.group_recent_images.get(group_id, []):
+                        same_message = (
+                            first_info.get("message_id") is not None
+                            and cached_image.get("message_id") == first_info.get("message_id")
+                        )
+                        same_source = (
+                            first_info.get("source_message_id")
+                            and cached_image.get("source_message_id")
+                            == first_info.get("source_message_id")
+                        )
+                        if (
+                            str(cached_image.get("user_qq") or "")
+                            == str(first_info.get("user_qq") or user_qq or "")
+                            and (same_message or same_source)
+                        ):
+                            cached_image["description"] = image_desc_for_memory
+                except Exception:
+                    logger.exception(
+                        "[IMAGE] 识别成功但写回消息记忆失败: message=%s",
+                        memory_message_id,
+                    )
+        else:
+            combined_text = (
+                f"{combined_text}\n\n[视觉工具状态]\n"
+                "这次图片识别失败或超时。不要猜测图片内容；自然说明暂时没看清即可。"
+            )
+            logger.warning("[IMAGE] 所有图片识别均失败")
 
     if weather_task:
         try:
@@ -1446,6 +1605,17 @@ async def _process_messages_inner(
                         ),
                         system_prompt=dynamic_system_prompt,
                     )
+                    if not (reply or "").strip():
+                        if join_instruction or dialogue_instruction:
+                            logger.info(
+                                "Context-gated reply abandoned after empty LLM output: group=%s kind=%s",
+                                group_id,
+                                "dialogue" if dialogue_instruction else "proactive",
+                            )
+                            if join_instruction:
+                                _trace_proactive("empty_generation", group_id)
+                            return
+                        reply = "刚刚没接上，你再发一次。"
                     if (
                         join_instruction or dialogue_instruction
                     ) and _is_silent_join_reply(reply):
@@ -1842,13 +2012,22 @@ async def _on_message(event: MessageEvent):
             asyncio.create_task(_do_general_poke())
 
         # ── 图片缓存：无论是否触发回复，都缓存有效图片 ──
-        image_infos = _extract_images(event)
+        image_infos = [
+            {
+                **image,
+                "message_id": message_id,
+                "source_message_id": source_message_id,
+                "user_qq": user_qq,
+                "timestamp": now_ts,
+                "memory_content": contextual_text,
+            }
+            for image in _extract_images(event)
+        ]
         if image_infos:
             cache = state.group_recent_images.setdefault(group_id_str, [])
             now = _time.time()
             for img in image_infos:
-                cache.append({"url": img["url"], "file": img["file"],
-                              "user_qq": user_qq, "time": now})
+                cache.append({**img, "time": now})
             # 清理过期 & 超量
             state.group_recent_images[group_id_str] = [
                 c for c in cache if now - c["time"] < state.IMAGE_CACHE_TTL
@@ -1880,6 +2059,8 @@ async def _on_message(event: MessageEvent):
             # ── 智能联网搜索：将搜索文本随消息传递到 _process_messages_inner ──
             search_text = message_text
             clean_search = ""
+            if search_text in {"[非文本群消息]", "[有成员@了小源]"}:
+                search_text = ""
             if search_text:
                 bot_names = get_config().get("bot", {}).get("nickname", "小源")
                 bot_names_list = [bot_names] if isinstance(bot_names, str) else bot_names
@@ -1890,10 +2071,8 @@ async def _on_message(event: MessageEvent):
                     logger.info("[Search] enqueued for group %s: '%s'", group_id_str, clean_search[:60])
 
             # ── 图片识别 ──
-            # 1) 当前消息带图：直接识别
+            # 1) 当前消息带图：随消息入队，在群级回复管线内识别
             # 2) 用户提到图片但消息里没图：从缓存中取该用户最近发的图
-            image_url_for_memory = None
-            image_desc_for_memory = None
             trigger_images = image_infos  # 当前消息里的图
 
             if not trigger_images:
@@ -1907,31 +2086,15 @@ async def _on_message(event: MessageEvent):
                     user_imgs = [c for c in cache
                                  if c["user_qq"] == user_qq and now - c["time"] < state.IMAGE_CACHE_TTL]
                     if user_imgs:
-                        trigger_images = [{"url": user_imgs[-1]["url"],
-                                           "file": user_imgs[-1]["file"]}]
-                        logger.info("[IMAGE] 从缓存取出 %s 的 %d 张图", user_qq, len(user_imgs))
+                        trigger_images = [dict(user_imgs[-1])]
+                        logger.info("[IMAGE] 从缓存取出 %s 最近的图片", user_qq)
 
-            if trigger_images:
-                logger.info("检测到 %d 张图片，开始视觉识别...", len(trigger_images))
-                desc_parts, image_url_for_memory, image_desc_for_memory = await _recognize_images(trigger_images, bot)
-                if desc_parts:
-                    effective_text = effective_text + "\n" + "\n".join(desc_parts)
-                    logger.info("图片识别完成，已附加 %d 条描述", len(desc_parts))
-                else:
-                    logger.warning("所有图片识别均失败")
-
-            if message_id is not None and (
-                effective_text != contextual_text
-                or image_url_for_memory
-                or image_desc_for_memory
-            ):
+            if message_id is not None and effective_text != contextual_text:
                 async with await get_session() as session:
                     await update_message_content(
                         session,
                         message_id,
                         content=effective_text,
-                        image_url=image_url_for_memory,
-                        image_description=image_desc_for_memory,
                     )
                     await session.commit()
 
@@ -1971,6 +2134,7 @@ async def _on_message(event: MessageEvent):
                         if dialogue_followup
                         else is_closing_message(message_text)
                     ),
+                    "images": trigger_images,
                     "search_text": clean_search,
                     "weather_query": weather_q,
                     "message_id": message_id,
