@@ -17,6 +17,7 @@ from .config import get_config
 from .database import (
     ContextSummary,
     Message,
+    delete_inbound_message_by_source_id,
     get_context_messages,
     get_session,
     get_user_display_names,
@@ -76,6 +77,26 @@ def schedule_vector_refresh(
         scene=scene,
         created_at=created_at,
     )
+
+
+async def forget_inbound_memory(
+    *,
+    group_id: str,
+    source_message_id: str,
+) -> int | None:
+    """Forget a recalled inbound message in both SQL and semantic memory."""
+    async with await get_session() as session:
+        message_id = await delete_inbound_message_by_source_id(
+            session,
+            group_id=group_id,
+            source_message_id=source_message_id,
+        )
+        await session.commit()
+    if message_id is not None:
+        from .vector_store import delete_messages
+
+        await delete_messages([message_id])
+    return message_id
 
 
 # ─── Weight Decay ─────────────────────────────────────────────────────────────
@@ -238,6 +259,7 @@ async def build_context(
         # 分用户记忆：当前说话人的历史发言
         user_history: list[Message] = []
         if user_qq and scene == "group" and group_id:
+            user_history_limit = max(8, min(30, int(max_tokens) // 300))
             user_history_stmt = (
                 select(Message)
                 .where(
@@ -247,7 +269,7 @@ async def build_context(
                     Message.role == "user",
                 )
                 .order_by(desc(Message.created_at), desc(Message.id))
-                .limit(30)
+                .limit(user_history_limit)
             )
             user_history_result = await session.execute(user_history_stmt)
             user_history = list(user_history_result.scalars().all())

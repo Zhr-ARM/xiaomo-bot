@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    delete,
     update,
     select,
     desc,
@@ -395,6 +396,32 @@ async def get_message_by_source_id(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def delete_inbound_message_by_source_id(
+    session: AsyncSession,
+    *,
+    group_id: str,
+    source_message_id: str,
+) -> int | None:
+    """Delete a recalled inbound message and its transport mapping."""
+    result = await session.execute(
+        select(InboundEvent.message_id).where(
+            InboundEvent.group_id == group_id,
+            InboundEvent.source_message_id == source_message_id,
+        )
+    )
+    message_id = result.scalar_one_or_none()
+    if message_id is None:
+        return None
+    await session.execute(
+        delete(InboundEvent).where(
+            InboundEvent.group_id == group_id,
+            InboundEvent.source_message_id == source_message_id,
+        )
+    )
+    await session.execute(delete(Message).where(Message.id == int(message_id)))
+    return int(message_id)
 
 
 async def link_source_message_id(

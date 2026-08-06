@@ -52,6 +52,13 @@ _FORCED_TECH_METAPHOR_RE = re.compile(
     r"(?:像|比).{0,18}(?:PID|debug|bug|板子|电压|电流|寄存器|示波器)",
     flags=re.I,
 )
+_POSTURING_RE = re.compile(r"哼|很凶|不好惹|休想驯服|才不要变乖")
+_EMOTICON_RE = re.compile(
+    r"[（(][^（）()\n]{0,24}(?:ω|Φ|Д|▽|ﾉ|;ω|=\^|´|｀)[^（）()\n]{0,24}[）)]"
+)
+_AFFECTIONATE_CUES = (
+    "宝宝", "宝贝", "可爱", "乖一点", "乖乖", "姐姐", "贴贴", "抱抱",
+)
 _QUESTION_START_RE = re.compile(
     r"^(?:怎么|咋|为什么|为何|谁|哪|什么|多少|几|能不能|可不可以|有没有|是不是)"
 )
@@ -140,6 +147,11 @@ def build_adaptive_style_instruction(
         lines.append("- 这是在分享近况，不是在求助；不要顺手追加教程、提醒、排障建议或‘下次记得’。")
     elif scene == "social_ack":
         lines.append("- 这是感谢、问候或确认；回半句就收住，不开启新话题。")
+    if any(cue in (current_text or "") for cue in _AFFECTIONATE_CUES):
+        lines.append(
+            "- 这是无害的亲昵称呼、夸奖或轻松逗趣；不用条件反射式拒绝，也别立刻摆出‘很凶/不好惹/休想驯服’的固定姿态。"
+            "可以自然接住、轻轻回逗，关系不明确时不要擅自升级亲密关系。"
+        )
 
     recent = [str(text) for text in (recent_assistant_replies or [])[-6:] if str(text).strip()]
     overused: list[str] = []
@@ -149,6 +161,10 @@ def build_adaptive_style_instruction(
         overused.append("括号里的耳朵尾巴动作")
     if sum(bool(_FORCED_TECH_METAPHOR_RE.search(text)) for text in recent) >= 2:
         overused.append("硬塞技术比喻")
+    if sum(bool(_POSTURING_RE.search(text)) for text in recent) >= 1:
+        overused.append("哼、很凶、不好惹这类逞强句式")
+    if sum(bool(_EMOTICON_RE.search(text)) for text in recent) >= 1:
+        overused.append("颜文字")
     if overused:
         lines.append(f"- 最近小源已经反复用过{'、'.join(overused)}；这一轮全部避开。")
 
@@ -157,6 +173,7 @@ def build_adaptive_style_instruction(
         lines.append(f"- 正在顺着 {clean_name} 的话接，不必先喊“{clean_name}同学”，直接说内容更自然。")
     lines.extend(
         [
+            "- 先回应当前这句话本身；不要为了找梗凭空说对方正在发呆、卡壳、生气或做某个动作。",
             "- 只选一个主要动作：接梗、回答、补一句看法、或问一个必要问题；不要写成‘反应+解释+建议+反问’全套。",
             "- 跟随的是句长和松紧，不模仿错别字、脏话或攻击性表达。",
             "[/当下群聊语感]",
@@ -230,6 +247,26 @@ def _decatify(text: str) -> str:
     return cleaned
 
 
+def _soften_repeated_posturing(
+    text: str,
+    recent_assistant_replies: list[str] | None,
+) -> str:
+    if _recent_habit_count(recent_assistant_replies, _POSTURING_RE) < 1:
+        return text
+    cleaned = re.sub(r"^\s*哼[！!，,。\s]*", "", text).strip()
+    return cleaned or text
+
+
+def _drop_repeated_emoticon(
+    text: str,
+    recent_assistant_replies: list[str] | None,
+) -> str:
+    if _recent_habit_count(recent_assistant_replies, _EMOTICON_RE) < 1:
+        return text
+    cleaned = _EMOTICON_RE.sub("", text)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
 def _soften_repeated_vocative(
     text: str,
     *,
@@ -293,14 +330,16 @@ def polish_tone(
     text = _reduce_verbal_tics(text)
 
     current_cat_count = len(_CAT_STYLE_RE.findall(text))
-    if current_cat_count > 1 or _recent_habit_count(
-        recent_assistant_replies, _CAT_STYLE_RE
-    ) >= 2:
+    recent_cat_count = _recent_habit_count(recent_assistant_replies, _CAT_STYLE_RE)
+    if current_cat_count > 1 or (current_cat_count > 0 and recent_cat_count >= 1):
         text = _decatify(text)
     elif len(_STAGE_ACTION_RE.findall(text)) > 1 or _recent_habit_count(
         recent_assistant_replies, _STAGE_ACTION_RE
     ):
         text = _STAGE_ACTION_RE.sub("", text)
+
+    text = _soften_repeated_posturing(text, recent_assistant_replies)
+    text = _drop_repeated_emoticon(text, recent_assistant_replies)
 
     text = _soften_repeated_vocative(
         text,

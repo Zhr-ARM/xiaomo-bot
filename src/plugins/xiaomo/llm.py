@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import os
+import logging
 
 from openai import AsyncOpenAI
 
 from .config import get_config
 from .persona import build_system_prompt
+
+logger = logging.getLogger("xiaomo.llm")
 
 
 class LLMClient:
@@ -96,7 +99,18 @@ class LLMClient:
                 ],
             )
 
-        content = (response.choices[0].message.content or "").strip()
+        choice = response.choices[0]
+        content = (choice.message.content or "").strip()
+        finish_reason = getattr(choice, "finish_reason", None)
+        logger.info(
+            "Chat completion finished: reason=%s chars=%d max_tokens=%d",
+            finish_reason,
+            len(content),
+            request_max_tokens,
+        )
+        if finish_reason == "length" and len(content) < 24:
+            logger.warning("Discarding visibly truncated chat completion: %r", content)
+            return ""
         return content
 
     async def decision(

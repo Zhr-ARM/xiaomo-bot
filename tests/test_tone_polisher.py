@@ -11,6 +11,40 @@ from src.plugins.xiaomo.tone_polisher import (
 )
 
 
+def test_affectionate_banter_is_not_framed_as_a_relationship_or_threat():
+    instruction = build_adaptive_style_instruction(
+        recent_group_messages=[],
+        recent_assistant_replies=[
+            "\u6211\u53ef\u662f\u5f88\u51f6\u7684",
+        ],
+        current_text="\u5b9d\u5b9d\u4f60\u597d\u53ef\u7231",
+        scene="casual_banter",
+    )
+
+    assert "\u4e0d\u7528\u6761\u4ef6\u53cd\u5c04\u5f0f\u62d2\u7edd" in instruction
+    assert "\u4e0d\u8981\u64c5\u81ea\u5347\u7ea7\u4eb2\u5bc6\u5173\u7cfb" in instruction
+    assert "\u901e\u5f3a\u53e5\u5f0f" in instruction
+
+
+def test_polish_tone_removes_recent_roleplay_tics_from_affectionate_reply():
+    polished = polish_tone(
+        "\u54fc\uff0c\u672c\u732b\u672c\u6765\u5c31\u5f88\u53ef\u7231\u561b\uff01(\u00b4;\u03c9;`)",
+        scene="casual_banter",
+        style="playful",
+        explicit_trigger=True,
+        recent_assistant_replies=[
+            "\u6211\u53ef\u662f\u5f88\u51f6\u7684\u55b5",
+            "\u522b\u6233\u6211 (\u00b4;\u03c9;`)",
+        ],
+        current_text="\u5b9d\u5b9d\u4f60\u597d\u53ef\u7231",
+    )
+
+    assert not polished.startswith("\u54fc")
+    assert "\u672c\u732b" not in polished
+    assert "\u55b5" not in polished
+    assert "\u00b4;\u03c9;`" not in polished
+
+
 def test_polish_tone_removes_formal_answer_shell_for_casual_chat():
     reply = (
         "\u4ee5\u4e0b\u662f\u6211\u7684\u56de\u7b54\uff1a\n"

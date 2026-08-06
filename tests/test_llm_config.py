@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import nonebot
+import pytest
 
 nonebot.init()
 
@@ -34,3 +37,34 @@ def test_llm_client_uses_configured_timeout_and_retries(monkeypatch):
     assert client.max_retries == 0
     assert captured["timeout"] == 18
     assert captured["max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_llm_discards_a_visibly_truncated_short_completion():
+    class FakeCompletions:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(content="three chars"),
+                    )
+                ]
+            )
+
+    client = object.__new__(llm.LLMClient)
+    client.model = "test-model"
+    client.max_tokens = 4096
+    client.temperature = 0.8
+    client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+
+    reply = await client.chat(
+        context="",
+        user_message="test",
+        max_tokens=320,
+        system_prompt="test system",
+    )
+
+    assert reply == ""

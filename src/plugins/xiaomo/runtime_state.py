@@ -31,6 +31,8 @@ _FIELDS = (
     "poke_user_last_time",
     "poke_group_last_time",
     "auto_poke_last_time",
+    "poke_reply_group_last_time",
+    "poke_reply_user_last_time",
     "proactive_join_last_time",
     "proactive_join_feedback",
     "group_moods",

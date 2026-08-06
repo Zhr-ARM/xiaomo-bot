@@ -61,6 +61,13 @@ poke_group_last_time: dict[str, float] = {}
 # 自动戳戳冷却：{target_qq} -> unix timestamp（每人独立冷却）
 auto_poke_last_time: dict[str, float] = {}
 
+# 群友戳机器人后的文字回复冷却，与机器人主动戳人分开统计。
+poke_reply_group_last_time: dict[str, float] = {}
+poke_reply_user_last_time: dict[str, float] = {}
+
+# 短期撤回标记：用于取消已经进入静默窗口或正在生成的回复。
+group_recalled_messages: dict[str, dict[str, float]] = {}
+
 proactive_join_last_time: dict[str, float] = {}
 
 # 主动接话反馈：根据“发完后是否有人接着聊”轻微调节后续主动概率
@@ -81,6 +88,7 @@ IMAGE_CACHE_TTL = 300
 RECENT_WINDOW_SECONDS = 300.0
 RECENT_TEXT_WINDOW_SECONDS = 180.0
 RECENT_TEXT_LIMIT = 48
+RECALL_TTL_SECONDS = 600.0
 
 
 def trim_recent_times(
@@ -308,6 +316,58 @@ def record_recent_group_text(
         }
     )
     group_recent_texts[group_id] = recent[-RECENT_TEXT_LIMIT:]
+
+
+def record_group_recall(
+    group_id: str,
+    source_message_id: str,
+    *,
+    now: float | None = None,
+) -> None:
+    """Mark a recalled message and remove it from live contextual caches."""
+    if now is None:
+        now = time.time()
+    group_key = str(group_id)
+    source_key = str(source_message_id or "")
+    if not source_key:
+        return
+    recalled = {
+        str(message_id): float(recalled_at)
+        for message_id, recalled_at in group_recalled_messages.get(group_key, {}).items()
+        if now - float(recalled_at) <= RECALL_TTL_SECONDS
+    }
+    recalled[source_key] = now
+    group_recalled_messages[group_key] = recalled
+    group_recent_texts[group_key] = [
+        item
+        for item in group_recent_texts.get(group_key, [])
+        if str(item.get("source_message_id") or "") != source_key
+    ]
+    group_recent_images[group_key] = [
+        item
+        for item in group_recent_images.get(group_key, [])
+        if str(item.get("source_message_id") or "") != source_key
+    ]
+
+
+def is_group_message_recalled(
+    group_id: str,
+    source_message_id: str | None,
+    *,
+    now: float | None = None,
+) -> bool:
+    if not source_message_id:
+        return False
+    if now is None:
+        now = time.time()
+    group_key = str(group_id)
+    recalled = {
+        str(message_id): float(recalled_at)
+        for message_id, recalled_at in group_recalled_messages.get(group_key, {}).items()
+        if now - float(recalled_at) <= RECALL_TTL_SECONDS
+    }
+    group_recalled_messages[group_key] = recalled
+    return str(source_message_id) in recalled
 
 
 def format_recent_group_flow(

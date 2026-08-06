@@ -10,6 +10,7 @@ database_path: "${DATABASE_PATH:-data/xiaomo.db}"
 bot:
   name: "小源"
   nickname: "小源"
+  at_aliases: ["CDUT 开源协会"]
   qq_id: "3115709797"
   persona_version: 2
 
@@ -91,6 +92,13 @@ human_timing:
 delivery:
   send_timeout_seconds: 12
 
+# 群友戳机器人后的短回复：直接互动会回应，但群里连续戳时保持克制。
+poke_reply:
+  enabled: true
+  group_cooldown_seconds: 360
+  user_cooldown_seconds: 600
+  after_bot_reply_seconds: 45
+
 # 类人化回复策略（显式 @ 或叫小源后的正式回复前置判断）
 humanize:
   enabled: true
@@ -105,6 +113,14 @@ humanize:
 memory:
   weight_half_life_minutes: 60
   max_context_tokens: 8000
+  scene_context_tokens:
+    social_ack: 2400
+    casual_banter: 3600
+    casual_question: 4000
+    personal_share: 4200
+    group_flow: 4600
+    image_question: 4600
+    support: 5200
   compress_threshold_tokens: 15000
   keep_recent_messages: 50
 

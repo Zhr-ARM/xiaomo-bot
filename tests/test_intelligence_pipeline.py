@@ -336,6 +336,102 @@ def test_dialogue_post_check_waits_for_speakers_newer_message(monkeypatch):
     state.group_dialogue_sessions.clear()
 
 
+def test_explicit_reply_yields_to_a_newer_turn_from_the_same_speaker():
+    from src.plugins.xiaomo import state
+
+    state.group_recent_texts.clear()
+    state.group_recalled_messages.clear()
+    state.record_recent_group_text(
+        "g1",
+        user_qq="u1",
+        nickname="A",
+        text="[image]",
+        source_message_id="new-image",
+        now=110.0,
+    )
+
+    ok, reason = handlers._post_send_context_check(
+        "g1",
+        {
+            "timestamp": 100.0,
+            "source_message_id": "old-request",
+            "user_qq": "u1",
+        },
+        explicit_trigger=True,
+        now=112.0,
+    )
+
+    assert ok is False
+    assert reason == "speaker added a newer turn"
+    state.group_recent_texts.clear()
+
+
+def test_recalled_source_is_cancelled_before_send():
+    from src.plugins.xiaomo import state
+
+    state.group_recalled_messages.clear()
+    state.record_group_recall("g1", "recalled-message", now=110.0)
+
+    ok, reason = handlers._post_send_context_check(
+        "g1",
+        {
+            "timestamp": 100.0,
+            "source_message_id": "recalled-message",
+            "user_qq": "u1",
+        },
+        explicit_trigger=True,
+        now=112.0,
+    )
+
+    assert ok is False
+    assert reason == "source message was recalled"
+    state.group_recalled_messages.clear()
+
+
+def test_short_visible_replies_keep_reasoning_budget():
+    assert handlers._generation_token_budget(80) == 320
+    assert handlers._generation_token_budget(900) == 1200
+    assert handlers._context_token_budget(8000, "casual_banter") == 3600
+    assert handlers._context_token_budget(8000, "technical_help") == 8000
+
+
+def test_repeat_wave_and_poke_replies_avoid_recent_wording():
+    from src.plugins.xiaomo import state
+
+    repeat = handlers._REPEAT_WAVE_REPLIES[0]
+    assert handlers._choose_repeat_wave_reaction(
+        avoid=[repeat], chooser=lambda values: values[0]
+    ) != repeat
+
+    poke = handlers._POKE_REPLIES[0]
+    assert handlers._choose_poke_reply(
+        [poke], chooser=lambda values: values[0]
+    ) != poke
+
+    state.poke_reply_group_last_time.clear()
+    state.poke_reply_user_last_time.clear()
+    state.bot_reply_times.clear()
+    config = {
+        "enabled": True,
+        "group_cooldown_seconds": 360,
+        "user_cooldown_seconds": 600,
+        "after_bot_reply_seconds": 45,
+    }
+    allowed, reason = handlers._poke_reply_allowed(
+        "g1", "u1", now=1000.0, cfg=config
+    )
+    assert allowed is True
+    assert reason == "allowed"
+
+    state.poke_reply_group_last_time["g1"] = 900.0
+    allowed, reason = handlers._poke_reply_allowed(
+        "g1", "u1", now=1000.0, cfg=config
+    )
+    assert allowed is False
+    assert reason == "group cooldown"
+    state.poke_reply_group_last_time.clear()
+
+
 def test_plain_text_at_only_triggers_for_bot(monkeypatch):
     class Segment:
         type = "text"
@@ -356,6 +452,32 @@ def test_plain_text_at_only_triggers_for_bot(monkeypatch):
     assert handlers._is_text_at_mention(Event("@别人 查一下"), "123456") is False
     assert handlers._is_text_at_mention(Event("@小源查一下天气"), "123456") is True
     assert handlers._is_text_at_mention(Event("@123456 查一下"), "123456") is True
+
+
+def test_plain_text_group_card_alias_only_counts_when_at_prefixed(monkeypatch):
+    class Segment:
+        type = "text"
+
+        def __init__(self, text):
+            self.data = {"text": text}
+
+    class Event:
+        def __init__(self, text):
+            self.message = [Segment(text)]
+
+    monkeypatch.setattr(
+        handlers,
+        "get_config",
+        lambda: {
+            "bot": {
+                "nickname": "xiaoyuan",
+                "at_aliases": ["CDUT Open Source"],
+            }
+        },
+    )
+
+    assert handlers._is_text_at_mention(Event("@CDUT Open Source hi")) is True
+    assert handlers._is_called("CDUT Open Source has an event") is False
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,7 @@ from .dialogue import (
 from .llm import get_llm
 from .memory import (
     build_context,
+    forget_inbound_memory,
     group_key,
     schedule_memory_compression,
     schedule_vector_refresh,
@@ -512,6 +513,23 @@ def _choose_local_light_reaction(
     return None
 
 
+_REPEAT_WAVE_REPLIES = (
+    "怎么突然开始复读了",
+    "这是在排队接暗号吗",
+    "你们怎么全刷上了",
+)
+
+
+def _choose_repeat_wave_reaction(
+    *,
+    avoid: list[str] | tuple[str, ...] | None = None,
+    chooser=random.choice,
+) -> str:
+    avoided = {(item or "").strip() for item in (avoid or [])}
+    available = [reply for reply in _REPEAT_WAVE_REPLIES if reply not in avoided]
+    return str(chooser(available or list(_REPEAT_WAVE_REPLIES)))
+
+
 def _recent_assistant_replies(
     group_id: str,
     structured_history: list[dict] | None,
@@ -539,6 +557,34 @@ def _response_temperature(scene: str, *, proactive: bool) -> float:
     if scene == "social_ack":
         return 0.72
     return 0.82 if proactive else 0.88
+
+
+def _context_token_budget(
+    default_max_tokens: int,
+    scene: str,
+    *,
+    configured_limits: dict | None = None,
+) -> int:
+    defaults = {
+        "social_ack": 2400,
+        "casual_banter": 3600,
+        "casual_question": 4000,
+        "personal_share": 4200,
+        "group_flow": 4600,
+        "image_question": 4600,
+        "support": 5200,
+    }
+    limits = configured_limits or {}
+    try:
+        scene_limit = int(limits.get(scene, defaults.get(scene, default_max_tokens)))
+    except (TypeError, ValueError):
+        scene_limit = defaults.get(scene, default_max_tokens)
+    return max(1200, min(int(default_max_tokens), scene_limit))
+
+
+def _generation_token_budget(reply_max_chars: int) -> int:
+    """Leave MiMo enough reasoning room even when the visible reply is tiny."""
+    return max(320, min(1200, max(1, int(reply_max_chars)) * 2))
 
 
 def _typing_delay_seconds(
@@ -581,10 +627,15 @@ def _post_send_context_check(
     explicit_trigger: bool,
     now: float | None = None,
 ) -> tuple[bool, str]:
+    source_message_id = str(current_msg.get("source_message_id") or "")
+    if state.is_group_message_recalled(group_id, source_message_id, now=now):
+        return False, "source message was recalled"
     if current_msg.get("dialogue_followup"):
         return _post_dialogue_context_check(group_id, current_msg, now=now)
-    if explicit_trigger or not current_msg.get("join_instruction"):
-        return True, "explicit-or-normal"
+    if explicit_trigger:
+        return _post_explicit_context_check(group_id, current_msg, now=now)
+    if not current_msg.get("join_instruction"):
+        return True, "normal"
 
     cfg = get_config().get("proactive_join", {}).get("post_check", {})
     if cfg.get("enabled", True) is False:
@@ -630,6 +681,35 @@ def _post_send_context_check(
         return False, "humans continued"
 
     return True, "still relevant"
+
+
+def _post_explicit_context_check(
+    group_id: str,
+    current_msg: dict,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """Let a newer message from the same speaker replace an in-flight answer."""
+    if now is None:
+        now = _time.time()
+    try:
+        started_at = float(current_msg.get("timestamp") or now)
+    except (TypeError, ValueError):
+        started_at = now
+    owner = str(current_msg.get("user_qq") or "")
+    current_source = str(current_msg.get("source_message_id") or "")
+    for item in state.group_recent_texts.get(group_id, []):
+        try:
+            item_time = float(item.get("time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if item_time <= started_at:
+            continue
+        if current_source and str(item.get("source_message_id") or "") == current_source:
+            continue
+        if owner and str(item.get("user_qq") or "") == owner:
+            return False, "speaker added a newer turn"
+    return True, "explicit turn still current"
 
 
 def _post_dialogue_context_check(
@@ -863,21 +943,32 @@ def _is_mentioned(event: GroupMessageEvent, bot_qq: str) -> bool:
 def _is_called(text: str) -> bool:
     if not text:
         return False
-    for name in _bot_name_candidates():
+    for name in _bot_name_candidates(include_at_aliases=False):
         if name in text:
             return True
     return False
 
 
-def _bot_name_candidates(bot_qq: str | None = None) -> list[str]:
+def _bot_name_candidates(
+    bot_qq: str | None = None,
+    *,
+    include_at_aliases: bool = True,
+) -> list[str]:
     names = []
     if bot_qq:
         names.append(str(bot_qq))
-    configured = get_config().get("bot", {}).get("nickname", "小源")
+    bot_cfg = get_config().get("bot", {})
+    configured = bot_cfg.get("nickname", "小源")
     if isinstance(configured, str):
         names.append(configured)
     else:
         names.extend(str(n) for n in configured if n)
+    if include_at_aliases:
+        at_aliases = bot_cfg.get("at_aliases", [])
+        if isinstance(at_aliases, str):
+            names.append(at_aliases)
+        else:
+            names.extend(str(n) for n in at_aliases if n)
     names.extend(["小源"])
     return [n for i, n in enumerate(names) if n and n not in names[:i]]
 
@@ -1150,6 +1241,18 @@ async def _process_messages(key: str, messages: list[dict]):
     if not messages:
         return
 
+    messages = [
+        message
+        for message in messages
+        if not state.is_group_message_recalled(
+            str(message.get("group_id") or ""),
+            str(message.get("source_message_id") or ""),
+        )
+    ]
+    if not messages:
+        logger.info("Reply batch dropped because all source messages were recalled")
+        return
+
     try:
         bot = get_bot()
     except Exception:
@@ -1317,12 +1420,17 @@ async def _process_messages_inner(
     if ambient_context_block and not batch_context:
         combined_text = f"{combined_text}\n\n{ambient_context_block}"
 
+    memory_cfg = get_config().get("memory", {})
     context, meta, structured_history = await build_context(
         scene="group",
         user_qq=user_qq,
         group_id=group_id,
-        half_life_minutes=get_config().get("memory", {}).get("weight_half_life_minutes", 60),
-        max_tokens=get_config().get("memory", {}).get("max_context_tokens", 8000),
+        half_life_minutes=memory_cfg.get("weight_half_life_minutes", 60),
+        max_tokens=_context_token_budget(
+            int(memory_cfg.get("max_context_tokens", 8000)),
+            frame.scene,
+            configured_limits=memory_cfg.get("scene_context_tokens", {}),
+        ),
         current_query=(frame.tool_plan.search_query if frame.tool_plan else "") or raw_text,
         exclude_message_ids=[
             m["message_id"]
@@ -1598,7 +1706,7 @@ async def _process_messages_inner(
                         mode=mode,
                         structured_history=structured_history,
                         group_id=group_id,
-                        max_tokens=max(128, min(1200, reply_max_chars * 2)),
+                        max_tokens=_generation_token_budget(reply_max_chars),
                         temperature=_response_temperature(
                             frame.scene,
                             proactive=bool(join_instruction),
@@ -2068,7 +2176,11 @@ async def _on_message(event: MessageEvent):
                     search_text = re.sub(rf"^{re.escape(name)}\s*", "", search_text)
                 clean_search = search_text.strip()
                 if clean_search:
-                    logger.info("[Search] enqueued for group %s: '%s'", group_id_str, clean_search[:60])
+                    logger.info(
+                        "[Search] candidate passed to planner for group %s: '%s'",
+                        group_id_str,
+                        clean_search[:60],
+                    )
 
             # ── 图片识别 ──
             # 1) 当前消息带图：随消息入队，在群级回复管线内识别
@@ -2152,17 +2264,32 @@ async def _on_message(event: MessageEvent):
                 ),
             )
 
-        # 复读检测
+        proactive_join_claimed = False
+
+        # 复读检测：接住“大家在复读”这个现象，而不是机械复制同一句。
         if text and not should_respond:
             repeat_text = await check_repeat(group_id_str, text)
             if repeat_text:
+                repeat_reply = _choose_repeat_wave_reaction(
+                    avoid=state.get_recent_bot_texts(group_id_str),
+                )
                 if await should_send_proactive_message(
                     group_id=group_id_str,
                     reason="repeat",
-                    candidate_text=repeat_text,
+                    candidate_text=repeat_reply,
                     trigger_text=text,
                 ):
-                    await _send_group_reply(bot, group_id_str, repeat_text)
+                    sent_message_id = await _send_group_reply(
+                        bot,
+                        group_id_str,
+                        repeat_reply,
+                    )
+                    state.mark_proactive_join_sent(
+                        group_id_str,
+                        source_message_id=sent_message_id,
+                    )
+                    schedule_persist()
+                    proactive_join_claimed = True
 
         # 主动接话 & 戳戳
         if not should_respond and text:
@@ -2173,10 +2300,8 @@ async def _on_message(event: MessageEvent):
                     asyncio.create_task(
                         try_poke_topic(group_id_str, user_qq, topic)
                     )
-        proactive_join_claimed = False
-
         # 关键词反应 / 弔图语录
-        if not should_respond and text:
+        if not should_respond and text and not proactive_join_claimed:
             join_cfg = get_config().get("proactive_join", {})
             if join_cfg.get("enabled", True):
                 now_ts = _time.time()
@@ -2291,7 +2416,10 @@ async def _on_message(event: MessageEvent):
                                 )
                                 if local_approved:
                                     current_local_msg = {
+                                        "group_id": group_id_str,
+                                        "user_qq": user_qq,
                                         "timestamp": now_ts,
+                                        "source_message_id": source_message_id,
                                         "join_instruction": _format_join_instruction(
                                             decision_payload
                                         ),
@@ -2353,6 +2481,7 @@ async def _on_message(event: MessageEvent):
                                         "search_text": "",
                                         "weather_query": "",
                                         "message_id": message_id,
+                                        "source_message_id": source_message_id,
                                         "join_instruction": _format_join_instruction(
                                             decision_payload
                                         ),
@@ -2403,14 +2532,50 @@ async def handle_message(bot: Bot, event: MessageEvent):
 
 # ─── 戳一戳 ──────────────────────────────────────────────────────────────────
 
-_POKE_REPLIES = [
-    "喵呜！不要戳小源啦 (´;ω;`)",
-    "哎呀！再戳小源要生气了哦！(｀・ω・´)",
-    "别戳了别戳了，毛都被你戳乱了喵...",
-    "呜哇！说了不要戳！(ﾉ>ω<)ﾉ",
-    "戳一下掉一根猫毛，你要负责喵！",
-    "Σ(ﾟДﾟ) 是谁在戳小源！",
-]
+_POKE_REPLIES = (
+    "看到了，别连戳",
+    "又戳我干嘛",
+    "在呢在呢",
+    "好好好，注意到你了",
+    "手下留情",
+)
+
+
+def _poke_reply_allowed(
+    group_id: str,
+    user_qq: str,
+    *,
+    now: float | None = None,
+    cfg: dict | None = None,
+) -> tuple[bool, str]:
+    if now is None:
+        now = _time.time()
+    poke_cfg = cfg if cfg is not None else get_config().get("poke_reply", {})
+    if poke_cfg.get("enabled", True) is False:
+        return False, "disabled"
+    group_cooldown = max(0.0, float(poke_cfg.get("group_cooldown_seconds", 360)))
+    user_cooldown = max(0.0, float(poke_cfg.get("user_cooldown_seconds", 600)))
+    after_bot = max(0.0, float(poke_cfg.get("after_bot_reply_seconds", 45)))
+    if now - float(state.poke_reply_group_last_time.get(group_id, 0)) < group_cooldown:
+        return False, "group cooldown"
+    user_key = f"{group_id}:{user_qq}"
+    if now - float(state.poke_reply_user_last_time.get(user_key, 0)) < user_cooldown:
+        return False, "user cooldown"
+    recent_bot_times = state.trim_recent_times(state.bot_reply_times, group_id, now=now)
+    if recent_bot_times and now - float(recent_bot_times[-1]) < after_bot:
+        return False, "bot just spoke"
+    return True, "allowed"
+
+
+def _choose_poke_reply(
+    recent_replies: list[str] | tuple[str, ...] | None = None,
+    *,
+    chooser=random.choice,
+) -> str:
+    avoided = {(item or "").strip() for item in (recent_replies or [])}
+    available = [reply for reply in _POKE_REPLIES if reply not in avoided]
+    return str(chooser(available or list(_POKE_REPLIES)))
+
 
 poke_handler = on_notice(priority=10, block=False)
 
@@ -2421,16 +2586,65 @@ async def handle_notice(bot: Bot, event: NoticeEvent):
     st = getattr(event, "sub_type", "")
     target = getattr(event, "target_id", None)
     gid = getattr(event, "group_id", None)
+    if nt == "group_recall" and gid:
+        group_id = str(gid)
+        if not _is_allowed_group(group_id):
+            return
+        source_message_id = str(getattr(event, "message_id", "") or "")
+        if not source_message_id:
+            return
+        state.record_group_recall(group_id, source_message_id)
+        try:
+            forgotten_id = await forget_inbound_memory(
+                group_id=group_id,
+                source_message_id=source_message_id,
+            )
+            logger.info(
+                "Group recall removed memory: group=%s source=%s message=%s",
+                group_id,
+                source_message_id,
+                forgotten_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to forget recalled message: group=%s source=%s",
+                group_id,
+                source_message_id,
+            )
+        from .runtime_state import schedule_persist
+
+        schedule_persist()
+        return
     if nt != "notify" or st != "poke":
         return
     if str(target) != str(bot.self_id):
         return
     if gid:
-        if not _is_allowed_group(str(gid)):
+        group_id = str(gid)
+        if not _is_allowed_group(group_id):
             return
-        import random as _random
-        reply = _random.choice(_POKE_REPLIES)
-        await _send_group_reply(bot, str(gid), reply)
+        user_qq = str(getattr(event, "user_id", "") or "")
+        now = _time.time()
+        allowed, reason = _poke_reply_allowed(
+            group_id,
+            user_qq,
+            now=now,
+        )
+        if not allowed:
+            logger.info(
+                "Poke reply skipped: group=%s user=%s reason=%s",
+                group_id,
+                user_qq,
+                reason,
+            )
+            return
+        reply = _choose_poke_reply(state.get_recent_bot_texts(group_id))
+        await _send_group_reply(bot, group_id, reply)
+        state.poke_reply_group_last_time[group_id] = now
+        state.poke_reply_user_last_time[f"{group_id}:{user_qq}"] = now
+        from .runtime_state import schedule_persist
+
+        schedule_persist()
 
 
 def setup_silent_callback():

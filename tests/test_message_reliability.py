@@ -635,6 +635,80 @@ async def test_memory_compression_deletes_only_the_summarized_batch(
 
 
 @pytest.mark.asyncio
+async def test_recall_forgets_sql_and_vector_memory(monkeypatch, tmp_path):
+    from src.plugins.xiaomo import vector_store
+
+    await database.close_database()
+    monkeypatch.setattr(
+        database,
+        "get_config",
+        lambda: {"database_path": str(tmp_path / "recall.db")},
+    )
+    deleted_vector_ids = []
+
+    async def fake_delete_messages(message_ids):
+        deleted_vector_ids.extend(message_ids)
+
+    monkeypatch.setattr(vector_store, "delete_messages", fake_delete_messages)
+    await database.init_database()
+
+    try:
+        async with await database.get_session() as session:
+            message, created, _user = await database.save_inbound_group_message(
+                session,
+                group_id="g1",
+                source_message_id="recalled-source",
+                user_qq="u1",
+                nickname="A",
+                content="temporary message",
+            )
+            await session.commit()
+        assert created is True
+        assert message is not None
+
+        deleted_id = await memory.forget_inbound_memory(
+            group_id="g1",
+            source_message_id="recalled-source",
+        )
+
+        async with await database.get_session() as session:
+            remaining = await database.get_message_by_source_id(
+                session,
+                group_id="g1",
+                source_message_id="recalled-source",
+            )
+        assert deleted_id == message.id
+        assert remaining is None
+        assert deleted_vector_ids == [message.id]
+    finally:
+        await database.close_database()
+
+
+def test_recall_removes_message_from_live_context_caches():
+    state.group_recent_texts.clear()
+    state.group_recent_images.clear()
+    state.group_recalled_messages.clear()
+    state.record_recent_group_text(
+        "g1",
+        user_qq="u1",
+        nickname="A",
+        text="temporary",
+        source_message_id="source-1",
+        now=100.0,
+    )
+    state.group_recent_images["g1"] = [
+        {"source_message_id": "source-1", "url": "https://example.test/image"}
+    ]
+
+    state.record_group_recall("g1", "source-1", now=101.0)
+
+    assert state.group_recent_texts["g1"] == []
+    assert state.group_recent_images["g1"] == []
+    assert state.is_group_message_recalled("g1", "source-1", now=102.0)
+    state.group_recalled_messages.clear()
+
+
+@pytest.mark.asyncio
 async def test_runtime_social_state_survives_restart(monkeypatch, tmp_path):
     from src.plugins.xiaomo import runtime_state
 
