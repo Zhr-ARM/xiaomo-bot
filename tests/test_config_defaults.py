@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from src.plugins.xiaomo.config import load_config
+import nonebot
+
+nonebot.init()
+
+from src.plugins.xiaomo.config import load_config  # noqa: E402
 
 
 def test_default_config_includes_active_group_ids():
@@ -8,6 +12,19 @@ def test_default_config_includes_active_group_ids():
 
     assert "1056259135" in cfg["allowed_group_ids"]
     assert "1070638552" in cfg["allowed_group_ids"]
+    assert "972277179" in cfg["allowed_group_ids"]
+
+
+def test_recruitment_group_has_scoped_policy_and_rate_limits():
+    cfg = load_config()["group_policies"]["972277179"]
+
+    assert cfg["self_reference"] == "小源"
+    assert cfg["civil_language"]["enabled"] is True
+    assert cfg["recruitment"]["website"] == "https://cdut-osa.cn"
+    assert cfg["recruitment"]["append_on_relevant_topic"] is True
+    assert cfg["proactive_join"]["score_bonus"] >= 15
+    assert cfg["proactive_join"]["max_bot_messages_5m"] <= 3
+    assert cfg["proactive_join"]["min_cooldown_seconds"] >= 45
 
 
 def test_default_proactive_join_is_chatty_but_rate_limited():

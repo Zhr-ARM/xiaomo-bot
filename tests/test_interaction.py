@@ -3,7 +3,7 @@ from __future__ import annotations
 import nonebot
 
 nonebot.init()
-from src.plugins.xiaomo import interaction
+from src.plugins.xiaomo import interaction  # noqa: E402
 
 
 def test_busy_group_and_recent_bot_reply_suppresses_proactive_interaction():
@@ -333,6 +333,57 @@ def test_join_opportunity_hard_caps_bot_at_two_messages_per_five_minutes():
             bot_messages_last_5m=2,
             seconds_since_bot_reply=180,
             human_messages_since_bot=10,
+        )
+    )
+
+    assert decision.action == "silent"
+    assert decision.reason == "bot spoke too much"
+
+
+def test_group_boost_allows_more_participation_but_keeps_a_hard_cap():
+    eligible = interaction.decide_join_opportunity(
+        interaction.JoinOpportunitySignals(
+            trigger_text="这个开源项目有点意思",
+            topic_match=True,
+            messages_last_5m=8,
+            bot_messages_last_5m=0,
+            seconds_since_bot_reply=1200,
+            human_messages_since_bot=8,
+            score_bonus=20,
+            max_bot_messages_5m=3,
+            min_human_turns_after_bot=2,
+        )
+    )
+    capped = interaction.decide_join_opportunity(
+        interaction.JoinOpportunitySignals(
+            trigger_text="这个 bug 怎么修",
+            topic_match=True,
+            messages_last_5m=16,
+            bot_messages_last_5m=3,
+            seconds_since_bot_reply=180,
+            human_messages_since_bot=10,
+            score_bonus=20,
+            max_bot_messages_5m=3,
+            min_human_turns_after_bot=2,
+        )
+    )
+
+    assert eligible.action in {"short_reply", "helpful_reply"}
+    assert capped.action == "silent"
+    assert capped.reason == "bot spoke too much"
+
+
+def test_group_hard_cap_also_applies_to_local_proactive_actions():
+    decision = interaction.decide_interaction(
+        interaction.InteractionSignals(
+            reason="join_helpful",
+            candidate_text="这个问题小源能帮你看看",
+            trigger_text="这个 bug 怎么修",
+            topic_match=True,
+            bot_messages_last_5m=3,
+            seconds_since_bot_reply=1200,
+            score_bonus=20,
+            max_bot_messages_5m=3,
         )
     )
 

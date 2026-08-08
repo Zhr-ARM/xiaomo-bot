@@ -25,6 +25,8 @@ class InteractionSignals:
     seconds_since_bot_reply: float = 9999.0
     user_total_messages: int = 0
     topic_match: bool = False
+    score_bonus: int = 0
+    max_bot_messages_5m: int = 2
 
 
 @dataclass
@@ -74,6 +76,9 @@ class JoinOpportunitySignals:
     seconds_since_bot_reply: float = 9999.0
     human_messages_since_bot: int = 999
     user_total_messages: int = 0
+    score_bonus: int = 0
+    max_bot_messages_5m: int = 2
+    min_human_turns_after_bot: int = 3
 
 
 @dataclass
@@ -142,6 +147,12 @@ def decide_interaction(signals: InteractionSignals) -> InteractionDecision:
 
     if signals.quiet_hours and not signals.explicit_trigger:
         return InteractionDecision(0, "silent", "quiet hours")
+    max_bot_messages = max(1, int(signals.max_bot_messages_5m))
+    if (
+        not signals.explicit_trigger
+        and signals.bot_messages_last_5m >= max_bot_messages
+    ):
+        return InteractionDecision(0, "silent", "bot spoke too much")
 
     score = 82 if signals.explicit_trigger else 45
     if signals.explicit_trigger:
@@ -160,6 +171,9 @@ def decide_interaction(signals: InteractionSignals) -> InteractionDecision:
         "join_helpful": 12,
     }
     score += reason_weights.get(signals.reason, 0)
+    if signals.score_bonus:
+        score += int(signals.score_bonus)
+        reasons.append("group participation boost")
 
     if _has_help_intent(signals.trigger_text):
         score += 25
@@ -185,10 +199,7 @@ def decide_interaction(signals: InteractionSignals) -> InteractionDecision:
             score -= 12
             reasons.append("active group")
 
-        if signals.bot_messages_last_5m >= 2:
-            score -= 30
-            reasons.append("bot spoke recently")
-        elif signals.bot_messages_last_5m == 1:
+        if signals.bot_messages_last_5m >= 1:
             score -= 18
 
         if signals.seconds_since_bot_reply < 60:
@@ -215,7 +226,8 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
     if signals.quiet_hours:
         return JoinOpportunityDecision(0, "silent", "quiet hours", 0)
     # A hard rolling cap keeps higher participation from turning into flooding.
-    if signals.bot_messages_last_5m >= 2:
+    max_bot_messages = max(1, int(signals.max_bot_messages_5m))
+    if signals.bot_messages_last_5m >= max_bot_messages:
         return JoinOpportunityDecision(0, "silent", "bot spoke too much", 0)
     if (
         signals.messages_last_5m >= 18
@@ -225,7 +237,9 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         return JoinOpportunityDecision(0, "silent", "busy group and recent bot reply", 0)
 
     reasons: list[str] = []
-    score = 38
+    score = 38 + int(signals.score_bonus)
+    if signals.score_bonus:
+        reasons.append("group participation boost")
 
     if _has_help_intent(text):
         score += 34
@@ -270,10 +284,10 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
         score += 6
         reasons.append("room to speak")
 
-    if signals.bot_messages_last_5m >= 2:
+    if max_bot_messages > 2 and signals.bot_messages_last_5m >= max_bot_messages - 1:
         score -= 34
         reasons.append("bot spoke too much")
-    elif signals.bot_messages_last_5m == 1:
+    elif signals.bot_messages_last_5m >= 1:
         score -= 18
         reasons.append("bot already spoke")
 
@@ -285,7 +299,11 @@ def decide_join_opportunity(signals: JoinOpportunitySignals) -> JoinOpportunityD
     elif signals.seconds_since_bot_reply < 600:
         score -= 4
 
-    if signals.human_messages_since_bot < 3 and signals.seconds_since_bot_reply < 900:
+    min_human_turns = max(0, int(signals.min_human_turns_after_bot))
+    if (
+        signals.human_messages_since_bot < min_human_turns
+        and signals.seconds_since_bot_reply < 900
+    ):
         score -= 10
         reasons.append("not enough human turns")
 

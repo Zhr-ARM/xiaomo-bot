@@ -10,6 +10,7 @@ from nonebot.adapters.onebot.v11 import Bot
 
 from . import state
 from .config import get_config
+from .group_policy import apply_outgoing_group_policy
 
 logger = logging.getLogger("xiaomo.delivery")
 
@@ -35,7 +36,11 @@ async def send_group_text(
 ) -> str | None:
     """Send first, then update local state and memory on confirmed success."""
 
-    clean = (content or "").strip()
+    clean = apply_outgoing_group_policy(
+        content,
+        group_id,
+        recent_bot_texts=state.get_recent_bot_texts(str(group_id), limit=20),
+    )
     if not clean:
         raise ValueError("group text cannot be empty")
 

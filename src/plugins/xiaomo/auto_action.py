@@ -19,6 +19,10 @@ from nonebot import get_bot
 
 from . import state
 from .config import get_config
+from .group_policy import (
+    build_group_policy_instruction,
+    get_effective_proactive_join_config,
+)
 from .interaction import InteractionSignals, decide_interaction
 from .llm import get_llm
 
@@ -151,11 +155,12 @@ async def _generate_contextual_bubble(group_id: str, recent_context: str) -> str
                 mode="normal",
                 structured_history=None,
                 group_id=group_id,
-                max_tokens=100,
+                max_tokens=240,
                 temperature=0.72,
                 system_prompt=(
                     "你是群聊跟进编辑器。宁可输出 [SILENT] 也不要为了活跃而找话说；"
-                    "只输出最终消息或 [SILENT]。"
+                    "只输出最终消息或 [SILENT]。\n\n"
+                    f"{build_group_policy_instruction(group_id)}"
                 ),
             )
     except Exception:
@@ -218,7 +223,9 @@ async def should_send_proactive_message(
         logger.info("Proactive message skipped in quiet hours: group=%s reason=%s", group_id, reason)
         return False
 
-    proactive_cfg = get_config().get("proactive", {})
+    config = get_config()
+    proactive_cfg = config.get("proactive", {})
+    join_cfg = get_effective_proactive_join_config(group_id, config=config)
     current_ts = time.time()
     group_msg_times = state.trim_recent_times(
         state.group_message_times, group_id, now=current_ts,
@@ -238,6 +245,8 @@ async def should_send_proactive_message(
                 current_ts - bot_reply_times[-1] if bot_reply_times else 9999.0
             ),
             topic_match=reason == "topic_engage",
+            score_bonus=int(join_cfg.get("score_bonus", 0)),
+            max_bot_messages_5m=int(join_cfg.get("max_bot_messages_5m", 2)),
         )
     )
     if interaction.action == "silent":

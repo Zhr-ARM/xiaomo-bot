@@ -60,6 +60,13 @@ def build_system_prompt(
 
     parts = [persona, time_context, format_almanac(now.date())]
 
+    if group_id:
+        from .group_policy import build_group_policy_instruction
+
+        group_instruction = build_group_policy_instruction(group_id)
+        if group_instruction:
+            parts.append(group_instruction)
+
     if memory:
         parts.append(
             "\n## 群聊记忆库\n"

@@ -61,6 +61,10 @@ from .humanize import (
     fallback_strategy,
     shape_reply,
 )
+from .group_policy import (
+    apply_outgoing_group_policy,
+    get_effective_proactive_join_config,
+)
 from .intelligence import (
     build_conversation_frame,
     build_frame_instruction,
@@ -637,7 +641,10 @@ def _post_send_context_check(
     if not current_msg.get("join_instruction"):
         return True, "normal"
 
-    cfg = get_config().get("proactive_join", {}).get("post_check", {})
+    cfg = get_effective_proactive_join_config(
+        group_id,
+        config=get_config(),
+    ).get("post_check", {})
     if cfg.get("enabled", True) is False:
         return True, "disabled"
 
@@ -1774,6 +1781,14 @@ async def _process_messages_inner(
                         speaker_name=user_display,
                         current_text=raw_text,
                     )
+                    reply = apply_outgoing_group_policy(
+                        reply,
+                        group_id,
+                        recent_bot_texts=state.get_recent_bot_texts(
+                            group_id,
+                            limit=20,
+                        ),
+                    )
                     print(f"[LLM] Reply received: len={len(reply)}")
                     # 情绪追踪：保持跨轮次角色连贯
                     if group_id:
@@ -2218,8 +2233,10 @@ async def _on_message(event: MessageEvent):
                 limit=int(
                     dialogue_cfg.get(
                         "recent_context_messages",
-                        get_config()
-                        .get("proactive_join", {})
+                        get_effective_proactive_join_config(
+                            group_id_str,
+                            config=get_config(),
+                        )
                         .get("recent_context_messages", 8),
                     )
                 ),
@@ -2302,7 +2319,10 @@ async def _on_message(event: MessageEvent):
                     )
         # 关键词反应 / 弔图语录
         if not should_respond and text and not proactive_join_claimed:
-            join_cfg = get_config().get("proactive_join", {})
+            join_cfg = get_effective_proactive_join_config(
+                group_id_str,
+                config=get_config(),
+            )
             if join_cfg.get("enabled", True):
                 now_ts = _time.time()
                 min_cooldown = float(join_cfg.get("min_cooldown_seconds", 600))
@@ -2342,6 +2362,13 @@ async def _on_message(event: MessageEvent):
                                 now_ts - last_bot if last_bot else 9999.0
                             ),
                             human_messages_since_bot=human_since_bot,
+                            score_bonus=int(join_cfg.get("score_bonus", 0)),
+                            max_bot_messages_5m=int(
+                                join_cfg.get("max_bot_messages_5m", 2)
+                            ),
+                            min_human_turns_after_bot=int(
+                                join_cfg.get("min_human_turns_after_bot", 3)
+                            ),
                         )
                     )
                     logger.info(

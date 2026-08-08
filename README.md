@@ -176,6 +176,7 @@ xiaomo-bot/
 │   ├── weather.py          # 天气查询 & 定时推送
 │   ├── vision.py           # 图片识别
 │   ├── config.py           # 配置加载
+│   ├── group_policy.py     # 群级人设、参与度与出站表达约束
 │   ├── state.py            # 运行时共享状态
 │   └── filter_utils.py     # 内容过滤 & 文本工具
 └── data/
@@ -189,7 +190,7 @@ xiaomo-bot/
 
 ```yaml
 # 允许回复的群号列表
-allowed_group_ids: ["1056259135", "1070638552"]
+allowed_group_ids: ["1056259135", "1070638552", "972277179"]
 
 # Bot 基本信息
 bot:
@@ -275,6 +276,27 @@ proactive_join:
     react: 0.55
     short_reply: 0.82
     helpful_reply: 0.95
+
+# 群级覆盖：只调整指定群。明确 @ / 点名回复不受主动消息上限影响。
+group_policies:
+  "972277179":
+    self_reference: "小源"       # 自指“我”在出站前统一为“小源”
+    civil_language:
+      enabled: true
+      fallback: "这句容易伤人，小源不评价人，还是聊事情本身吧。"
+    recruitment:
+      enabled: true
+      website: "https://cdut-osa.cn"
+      append_on_relevant_topic: true # 招新相关话题顺势补官网，1 小时内不重复
+    proactive_join:
+      min_cooldown_seconds: 60
+      score_bonus: 20
+      max_bot_messages_5m: 3     # 所有非点名主动行为共享的硬上限
+      min_human_turns_after_bot: 2
+      probability:
+        react: 0.72
+        short_reply: 0.92
+        helpful_reply: 0.98
 
 # 发送节奏（模拟真人打字，显式 @ 会保持快）
 human_timing:
