@@ -23,7 +23,7 @@ class SilentWindow:
 
     两阶段设计：
     - WAITING: 计时器倒计时，新消息会重置计时器（合批）
-    - PROCESSING: 回调正在执行（LLM 调用中），新消息进入缓冲区，不打断
+    - PROCESSING: 新消息进入缓冲；显式请求可取消正在生成的主动插话
     """
 
     def __init__(self):
@@ -41,9 +41,10 @@ class SilentWindow:
         self._pending: dict[str, list[dict]] = defaultdict(list)
         self._callback: ReplyCallback | None = None
         self._closed = False
-        # 正在处理中的 key 集合 — 此时新消息不打断，只缓冲
+        # 正在处理中的 key 集合；显式消息可抢占主动插话，其余消息只缓冲。
         self._processing: set[str] = set()
         self._processing_tasks: dict[str, asyncio.Task] = {}
+        self._processing_solicited: dict[str, bool] = {}
         # 记录每个 key 是群聊还是私聊，处理完重启计时器时用
         self._is_group: dict[str, bool] = {}
         # 每个 key 的本轮等待时长；显式 @ 可以使用更短窗口，普通群聊仍用默认窗口。
@@ -64,7 +65,7 @@ class SilentWindow:
         将消息加入等待队列并重置计时器。
         key: conversation key (如 private:123456 或 group:789012)
 
-        如果回调正在处理中（LLM 调用进行中），只缓冲消息，不打断。
+        如果回调正在处理中，普通消息只缓冲；显式请求可抢占主动插话。
         """
         if self._closed:
             logger.warning("SilentWindow ignored message after shutdown: %s", key)
@@ -75,8 +76,21 @@ class SilentWindow:
         default_wait = self._group_seconds if is_group else self._private_seconds
         self._wait_seconds[key] = default_wait if wait_seconds is None else max(0.0, float(wait_seconds))
 
-        # 回调正在处理中 → 不打断，消息已缓冲，后续会自动处理
+        # A direct mention should not wait behind an in-flight ambient interjection.
         if key in self._processing:
+            incoming_solicited = bool(
+                message.get("explicit_trigger") or message.get("dialogue_followup")
+            )
+            current_solicited = self._processing_solicited.get(key, False)
+            task = self._processing_tasks.get(key)
+            if (
+                incoming_solicited
+                and not current_solicited
+                and task is not None
+                and not task.done()
+            ):
+                logger.info("Solicited turn preempted ambient processing for %s", key)
+                task.cancel()
             return
 
         # 取消等待中的旧计时器（还没进入 processing 阶段）
@@ -149,6 +163,10 @@ class SilentWindow:
                 self._processing_tasks[key] = current_task
 
             messages = self._pending.pop(key, [])
+            self._processing_solicited[key] = any(
+                message.get("explicit_trigger") or message.get("dialogue_followup")
+                for message in messages
+            )
 
             if messages and self._callback:
                 await self._callback(key, messages)
@@ -160,6 +178,7 @@ class SilentWindow:
         finally:
             self._processing.discard(key)
             self._processing_tasks.pop(key, None)
+            self._processing_solicited.pop(key, None)
 
             # 处理期间有新消息到达 → 重启计时器，不让它们被遗忘
             if not self._closed and key in self._pending and self._pending[key]:
@@ -198,6 +217,7 @@ class SilentWindow:
         self._timers.clear()
         self._processing_tasks.clear()
         self._processing.clear()
+        self._processing_solicited.clear()
         self._pending.clear()
         self._wait_seconds.clear()
 

@@ -586,9 +586,35 @@ def _context_token_budget(
     return max(1200, min(int(default_max_tokens), scene_limit))
 
 
-def _generation_token_budget(reply_max_chars: int) -> int:
+def _generation_token_budget(
+    reply_max_chars: int,
+    *,
+    solicited: bool = False,
+) -> int:
     """Leave MiMo enough reasoning room even when the visible reply is tiny."""
-    return max(320, min(1200, max(1, int(reply_max_chars)) * 2))
+    visible_chars = max(1, int(reply_max_chars))
+    if solicited:
+        return max(768, min(1600, visible_chars * 3))
+    return max(320, min(1200, visible_chars * 2))
+
+
+_TURN_CORRECTION_RE = re.compile(
+    r"谁问你了|又没问你|没问你|没有问你|没叫你|没有叫你|"
+    r"不是问你|没和你说|别乱接话|不要乱接话|怎么.{0,6}乱接话"
+)
+
+
+def _local_turn_correction_reply(text: str) -> str | None:
+    if _TURN_CORRECTION_RE.search((text or "").strip()):
+        return "确实接错话了，抱歉。"
+    return None
+
+
+def _generation_failure_reply(text: str) -> str:
+    clean = (text or "").strip()
+    if any(cue in clean for cue in ("?", "？", "怎么", "为什么", "谁", "哪", "吗")):
+        return "这题小源刚才没答出来，先不乱编。"
+    return "小源刚才卡住了，没接好这句。"
 
 
 def _typing_delay_seconds(
@@ -1017,6 +1043,42 @@ def _extract_mentioned_qqs(event: GroupMessageEvent) -> list[str]:
     ]
 
 
+def _has_text_at_other_member(event: GroupMessageEvent, bot_qq: str) -> bool:
+    bot_names = set(_bot_name_candidates(bot_qq))
+    for seg in event.message:
+        if seg.type != "text":
+            continue
+        text = str(seg.data.get("text") or "")
+        for match in re.finditer(r"(?:^|\s)@([^\s，,：:]{1,40})", text):
+            name = match.group(1).strip()
+            if name and name not in bot_names and name not in {"全体成员", "all"}:
+                return True
+    return False
+
+
+def _is_addressed_elsewhere(
+    *,
+    mentioned_qqs: list[str] | None,
+    bot_qq: str | None,
+    direct_bot_address: bool,
+    reply_to_message_id: str | None,
+    quoted_user_qq: str | None,
+    text_at_other_member: bool = False,
+) -> bool:
+    """Recognize a human-to-human turn before any proactive reply path."""
+
+    if direct_bot_address:
+        return False
+    bot_id = str(bot_qq or "")
+    if any(str(qq) and str(qq) != bot_id for qq in (mentioned_qqs or [])):
+        return True
+    if text_at_other_member:
+        return True
+    if reply_to_message_id:
+        return not quoted_user_qq or str(quoted_user_qq) != bot_id
+    return False
+
+
 def _extract_reply_message_id(event: GroupMessageEvent) -> str | None:
     for seg in event.message:
         if seg.type == "reply":
@@ -1286,7 +1348,7 @@ async def _process_messages(key: str, messages: list[dict]):
         if context_only_gate and not has_explicit:
             return
         try:
-            fallback = "刚刚这边卡了一下，你再发一次试试。"
+            fallback = "小源刚才处理这句时出错了，先不乱回。"
             sent_message_id = await _send_group_reply(
                 bot, group_id,
                 fallback,
@@ -1713,7 +1775,10 @@ async def _process_messages_inner(
                         mode=mode,
                         structured_history=structured_history,
                         group_id=group_id,
-                        max_tokens=_generation_token_budget(reply_max_chars),
+                        max_tokens=_generation_token_budget(
+                            reply_max_chars,
+                            solicited=solicited_trigger,
+                        ),
                         temperature=_response_temperature(
                             frame.scene,
                             proactive=bool(join_instruction),
@@ -1730,7 +1795,7 @@ async def _process_messages_inner(
                             if join_instruction:
                                 _trace_proactive("empty_generation", group_id)
                             return
-                        reply = "刚刚没接上，你再发一次。"
+                        reply = _generation_failure_reply(raw_text)
                     if (
                         join_instruction or dialogue_instruction
                     ) and _is_silent_join_reply(reply):
@@ -1807,7 +1872,7 @@ async def _process_messages_inner(
                         if join_instruction:
                             _trace_proactive("llm_failure", group_id)
                         return
-                    reply = "刚刚没生成出来，等几秒再发我一次。"
+                    reply = _generation_failure_reply(raw_text)
                     print(f"[LLM] Exception: {e}")
     except TimeoutError:
         logger.warning("LLM lock timeout for group %s", group_id)
@@ -1822,7 +1887,7 @@ async def _process_messages_inner(
             return
         print(f"[LLM] Lock timeout for group={group_id}, sending fallback")
         try:
-            fallback = "刚刚没接上，你再发一次。"
+            fallback = _generation_failure_reply(raw_text)
             sent_message_id = await _send_group_reply(
                 bot, group_id,
                 fallback,
@@ -1917,6 +1982,7 @@ async def _on_message(event: MessageEvent):
         now_ts = _time.time()
         source_message_id = _event_source_message_id(event)
         mentioned_qqs = _extract_mentioned_qqs(event)
+        text_at_other_member = _has_text_at_other_member(event, state.bot_qq_id)
         reply_to_message_id = _extract_reply_message_id(event)
         mentions_bot = _is_mentioned(event, state.bot_qq_id)
         called_bot = _is_called(text)
@@ -1967,6 +2033,25 @@ async def _on_message(event: MessageEvent):
             group_id=group_id_str,
             reply_to_message_id=reply_to_message_id,
         )
+        direct_bot_address = bool(
+            mentions_bot
+            or text_at
+            or to_me
+            or (
+                reply_to_message_id
+                and quoted_user_qq == str(state.bot_qq_id)
+            )
+        )
+        addressed_elsewhere = _is_addressed_elsewhere(
+            mentioned_qqs=mentioned_qqs,
+            bot_qq=state.bot_qq_id,
+            direct_bot_address=direct_bot_address,
+            reply_to_message_id=reply_to_message_id,
+            quoted_user_qq=quoted_user_qq,
+            text_at_other_member=text_at_other_member,
+        )
+        if addressed_elsewhere:
+            explicit_trigger = False
         dialogue_cfg = get_config().get("conversation_followup", {})
         followup_decision = ContinuationDecision(False, "explicit-trigger")
         if not explicit_trigger:
@@ -2050,17 +2135,20 @@ async def _on_message(event: MessageEvent):
             mentioned_qqs=mentioned_qqs,
             reply_to_message_id=reply_to_message_id,
             carried_from_previous=carried_from_previous,
+            addressed_elsewhere=addressed_elsewhere,
             now=state.group_last_active[group_id_str],
         )
-        feedback_outcome = state.observe_proactive_join_feedback(
-            group_id_str,
-            user_qq=user_qq,
-            bot_qq=state.bot_qq_id,
-            text=contextual_text,
-            mentions_bot=explicit_trigger,
-            reply_to_message_id=reply_to_message_id,
-            now=state.group_last_active[group_id_str],
-        )
+        feedback_outcome = None
+        if not addressed_elsewhere:
+            feedback_outcome = state.observe_proactive_join_feedback(
+                group_id_str,
+                user_qq=user_qq,
+                bot_qq=state.bot_qq_id,
+                text=contextual_text,
+                mentions_bot=explicit_trigger,
+                reply_to_message_id=reply_to_message_id,
+                now=state.group_last_active[group_id_str],
+            )
         if feedback_outcome:
             logger.info(
                 "Proactive join feedback: group=%s outcome=%s multiplier=%.2f",
@@ -2100,7 +2188,11 @@ async def _on_message(event: MessageEvent):
 
         # 规则1：指定目标即时戳（短冷却）
         auto_poke_target = is_auto_poke_target(user_qq, nickname)
-        if auto_poke_target and _should_poke(auto_poke_target.get("cooldown_minutes", 5)):
+        if (
+            not addressed_elsewhere
+            and auto_poke_target
+            and _should_poke(auto_poke_target.get("cooldown_minutes", 5))
+        ):
             async def _do_target_poke():
                 try:
                     if not await should_send_proactive_message(
@@ -2118,7 +2210,11 @@ async def _on_message(event: MessageEvent):
 
         # 规则2：任何人发言，30 分钟内戳一次
         poke_everyone_cd = get_config().get("poke_everyone_cooldown_minutes", 0)
-        if poke_everyone_cd > 0 and _should_poke(poke_everyone_cd):
+        if (
+            not addressed_elsewhere
+            and poke_everyone_cd > 0
+            and _should_poke(poke_everyone_cd)
+        ):
             async def _do_general_poke():
                 try:
                     if not await should_send_proactive_message(
@@ -2158,6 +2254,37 @@ async def _on_message(event: MessageEvent):
             logger.info("[IMAGE] 缓存 %d 张图片 (群 %s 共 %d 张)",
                         len(image_infos), group_id_str,
                         len(state.group_recent_images[group_id_str]))
+
+        if addressed_elsewhere:
+            logger.info(
+                "Skipping unsolicited actions for human-directed turn: group=%s "
+                "user=%s mentions=%s reply_to=%s quoted_qq=%s",
+                group_id_str,
+                user_qq,
+                other_mentions,
+                reply_to_message_id or "",
+                quoted_user_qq or "",
+            )
+            return
+
+        correction_reply = (
+            _local_turn_correction_reply(message_text) if should_respond else None
+        )
+        if correction_reply:
+            sent_message_id = await _send_group_reply(
+                bot,
+                group_id_str,
+                correction_reply,
+            )
+            state.close_dialogue_session(group_id_str, user_qq=user_qq)
+            schedule_persist()
+            logger.info(
+                "Acknowledged mistaken turn locally: group=%s user=%s message=%s",
+                group_id_str,
+                user_qq,
+                sent_message_id or "",
+            )
+            return
 
         # ── 天气查询：这里只记录意图，实际 HTTP 请求放到回复处理阶段并发执行 ──
         weather_q = ""

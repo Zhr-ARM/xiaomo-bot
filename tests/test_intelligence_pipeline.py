@@ -391,8 +391,17 @@ def test_recalled_source_is_cancelled_before_send():
 def test_short_visible_replies_keep_reasoning_budget():
     assert handlers._generation_token_budget(80) == 320
     assert handlers._generation_token_budget(900) == 1200
+    assert handlers._generation_token_budget(80, solicited=True) == 768
+    assert handlers._generation_token_budget(900, solicited=True) == 1600
     assert handlers._context_token_budget(8000, "casual_banter") == 3600
     assert handlers._context_token_budget(8000, "technical_help") == 8000
+
+
+def test_turn_correction_and_generation_failure_replies_are_contextual():
+    assert handlers._local_turn_correction_reply("谁问你了") == "确实接错话了，抱歉。"
+    assert handlers._local_turn_correction_reply("继续说刚才那个") is None
+    assert "再发一次" not in handlers._generation_failure_reply("这个怎么玩？")
+    assert "不乱编" in handlers._generation_failure_reply("这个怎么玩？")
 
 
 def test_repeat_wave_and_poke_replies_avoid_recent_wording():

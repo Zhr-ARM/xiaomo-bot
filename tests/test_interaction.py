@@ -270,6 +270,26 @@ def test_unrelated_next_message_is_neutral_proactive_feedback():
     assert state.proactive_join_probability_multiplier("g1") == 1.0
 
 
+def test_turn_rejection_decreases_proactive_probability():
+    from src.plugins.xiaomo import state
+
+    state.proactive_join_feedback.clear()
+    state.mark_proactive_join_sent("g1", source_message_id="bot-1", now=100.0)
+
+    outcome = state.observe_proactive_join_feedback(
+        "g1",
+        user_qq="u1",
+        bot_qq="bot",
+        text="谁问你了，别乱接话",
+        mentions_bot=True,
+        reply_to_message_id="bot-1",
+        now=120.0,
+    )
+
+    assert outcome == "rejected"
+    assert state.proactive_join_probability_multiplier("g1") < 1.0
+
+
 def test_proactive_feedback_decreases_probability_after_stall():
     from src.plugins.xiaomo import state
 

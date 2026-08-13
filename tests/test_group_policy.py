@@ -10,6 +10,13 @@ from src.plugins.xiaomo import delivery, group_policy, persona  # noqa: E402
 
 def _policy_config() -> dict:
     return {
+        "outgoing_policy": {
+            "self_reference": "小源",
+            "civil_language": {
+                "enabled": True,
+                "fallback": "这句容易伤人，小源只聊事情本身。",
+            },
+        },
         "proactive_join": {
             "enabled": True,
             "min_cooldown_seconds": 90,
@@ -22,11 +29,6 @@ def _policy_config() -> dict:
         },
         "group_policies": {
             "972277179": {
-                "self_reference": "小源",
-                "civil_language": {
-                    "enabled": True,
-                    "fallback": "这句容易伤人，小源只聊事情本身。",
-                },
                 "recruitment": {
                     "enabled": True,
                     "website": "https://cdut-osa.cn",
@@ -71,7 +73,19 @@ def test_group_policy_rewrites_only_natural_first_person_text(monkeypatch):
     assert "你和小源都懂" in rewritten
     assert "自我介绍" in rewritten
     assert "print('我不应被改')" in rewritten
-    assert group_policy.apply_outgoing_group_policy("我爱你", "other") == "我爱你"
+    assert group_policy.apply_outgoing_group_policy("我爱你", "other") == "小源爱你"
+
+
+def test_group_specific_policy_inherits_global_outgoing_policy(monkeypatch):
+    monkeypatch.setattr(group_policy, "get_config", _policy_config)
+
+    ordinary = group_policy.get_group_policy("1070638552")
+    recruitment = group_policy.get_group_policy("972277179")
+
+    assert ordinary["self_reference"] == "小源"
+    assert ordinary.get("recruitment") is None
+    assert recruitment["self_reference"] == "小源"
+    assert recruitment["recruitment"]["enabled"] is True
 
 
 def test_group_policy_blocks_clear_personal_attacks(monkeypatch):

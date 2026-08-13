@@ -23,6 +23,7 @@ def _group_event(
     user_id: int,
     text: str = "",
     at_bot: bool = False,
+    at_qq: int | None = None,
     image_url: str = "",
     card: str = "群名片",
 ) -> GroupMessageEvent:
@@ -31,6 +32,8 @@ def _group_event(
         segments.append(MessageSegment.text(text))
     if at_bot:
         segments.append(MessageSegment.at(3115709797))
+    if at_qq is not None:
+        segments.append(MessageSegment.at(at_qq))
     if image_url:
         segments.append(
             MessageSegment(
@@ -73,6 +76,77 @@ class _CaptureWindow:
 
     def enqueue(self, key, message, **kwargs):
         self.items.append((key, message, kwargs))
+
+
+@pytest.mark.asyncio
+async def test_at_other_member_is_remembered_without_queuing_a_reply(
+    monkeypatch,
+    tmp_path,
+):
+    await database.close_database()
+    monkeypatch.setattr(
+        database,
+        "get_config",
+        lambda: {"database_path": str(tmp_path / "human-directed.db")},
+    )
+    await database.init_database()
+
+    capture = _CaptureWindow()
+    monkeypatch.setattr(handlers, "get_bot", lambda: _FakeBot())
+    monkeypatch.setattr(handlers, "get_silent_window", lambda: capture)
+    monkeypatch.setattr(handlers, "_is_allowed_group", lambda _group_id: True)
+    monkeypatch.setattr(
+        handlers,
+        "get_config",
+        lambda: {
+            "bot": {"nickname": "小源", "qq_id": "3115709797"},
+            "conversation_followup": {"enabled": True},
+            "proactive_join": {"enabled": True, "recent_context_messages": 8},
+            "reactions": {"triggers": {}},
+            "poke_everyone_cooldown_minutes": 0,
+        },
+    )
+
+    async def initialized():
+        return None
+
+    monkeypatch.setattr(handlers, "_ensure_init", initialized)
+    from src.plugins.xiaomo import runtime_state
+
+    monkeypatch.setattr(runtime_state, "schedule_persist", lambda *_args, **_kwargs: None)
+    state.group_recent_texts.clear()
+    state.group_last_human_turn_directed_elsewhere.clear()
+    state.group_dialogue_sessions.clear()
+    state.group_message_times.clear()
+    state.bot_reply_times.clear()
+    state.bot_qq_id = "3115709797"
+
+    try:
+        await handlers._on_message(
+            _group_event(
+                message_id=550,
+                user_id=2531321684,
+                text="你怎么不去拿个国一",
+                at_qq=3160699975,
+                card="26级信工",
+            )
+        )
+
+        assert capture.items == []
+        recent = state.group_recent_texts["1070638552"][-1]
+        assert recent["user_qq"] == "2531321684"
+        assert recent["mentioned_qqs"] == ["3160699975"]
+        assert recent["addressed_elsewhere"] is True
+        assert state.group_last_human_turn_directed_elsewhere["1070638552"] is True
+        assert state.get_dialogue_session("1070638552", now=1) is None
+        async with await database.get_session() as session:
+            count = await session.scalar(select(func.count(database.Message.id)))
+        assert count == 1
+    finally:
+        state.group_recent_texts.clear()
+        state.group_last_human_turn_directed_elsewhere.clear()
+        state.group_dialogue_sessions.clear()
+        await database.close_database()
 
 
 @pytest.mark.asyncio
@@ -381,6 +455,67 @@ def test_other_mentions_keep_their_display_name():
     )()
 
     assert handlers._extract_at_text(event, "bot") == "这是谁发的 @天照命"
+
+
+def test_structured_at_to_another_member_blocks_unsolicited_reply():
+    assert handlers._is_addressed_elsewhere(
+        mentioned_qqs=["3160699975"],
+        bot_qq="3115709797",
+        direct_bot_address=False,
+        reply_to_message_id=None,
+        quoted_user_qq=None,
+    ) is True
+
+
+def test_reply_to_another_member_blocks_unsolicited_reply():
+    assert handlers._is_addressed_elsewhere(
+        mentioned_qqs=[],
+        bot_qq="3115709797",
+        direct_bot_address=False,
+        reply_to_message_id="human-message",
+        quoted_user_qq="3160699975",
+    ) is True
+
+
+def test_unresolved_reply_target_is_conservatively_left_alone():
+    assert handlers._is_addressed_elsewhere(
+        mentioned_qqs=[],
+        bot_qq="3115709797",
+        direct_bot_address=False,
+        reply_to_message_id="unresolved-message",
+        quoted_user_qq=None,
+    ) is True
+
+
+def test_calling_bot_explicitly_can_include_another_member():
+    assert handlers._is_addressed_elsewhere(
+        mentioned_qqs=["3160699975", "3115709797"],
+        bot_qq="3115709797",
+        direct_bot_address=True,
+        reply_to_message_id=None,
+        quoted_user_qq=None,
+    ) is False
+
+
+def test_merely_naming_bot_does_not_override_at_to_another_member():
+    assert handlers._is_called("小源这次是不是接错了") is True
+    assert handlers._is_addressed_elsewhere(
+        mentioned_qqs=["3160699975"],
+        bot_qq="3115709797",
+        direct_bot_address=False,
+        reply_to_message_id=None,
+        quoted_user_qq=None,
+    ) is True
+
+
+def test_plain_text_at_to_another_member_is_recognized():
+    class Segment:
+        type = "text"
+        data = {"text": "@Mhhhhhh 你怎么不去拿个国一"}
+
+    event = type("Event", (), {"message": [Segment()]})()
+
+    assert handlers._has_text_at_other_member(event, "3115709797") is True
 
 
 def test_ordinary_how_question_does_not_plan_a_web_search():

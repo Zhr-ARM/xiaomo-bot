@@ -57,11 +57,16 @@ def get_group_policy(
     if group_id is None:
         return {}
     effective_config = config if isinstance(config, dict) else get_config()
+    base_policy = effective_config.get("outgoing_policy", {})
+    if not isinstance(base_policy, dict):
+        base_policy = {}
     policies = effective_config.get("group_policies", {})
     if not isinstance(policies, dict):
-        return {}
-    policy = policies.get(str(group_id), {})
-    return policy if isinstance(policy, dict) else {}
+        policies = {}
+    override = policies.get(str(group_id), {})
+    if not isinstance(override, dict):
+        override = {}
+    return _deep_merge(base_policy, override)
 
 
 def get_effective_proactive_join_config(
@@ -120,9 +125,14 @@ def build_group_policy_instruction(group_id: str | int | None) -> str:
             ]
         )
 
+    if policy.get("proactive_join") or (
+        isinstance(recruitment, dict) and recruitment.get("enabled", False)
+    ):
+        lines.append(
+            "- 可以比其他群更积极地接梗、回答或补充一句，但仍要紧跟当前话题，不抢群友之间的对话。",
+        )
     lines.extend(
         [
-            "- 可以比其他群更积极地接梗、回答或补充一句，但仍要紧跟当前话题，不抢群友之间的对话。",
             "- 夜间无人说话时保持安静，不为了活跃而发‘有人吗’或空泛招新广告。",
             "[/GROUP_POLICY]",
         ]

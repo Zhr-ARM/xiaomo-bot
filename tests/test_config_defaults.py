@@ -16,10 +16,11 @@ def test_default_config_includes_active_group_ids():
 
 
 def test_recruitment_group_has_scoped_policy_and_rate_limits():
-    cfg = load_config()["group_policies"]["972277179"]
+    config = load_config()
+    cfg = config["group_policies"]["972277179"]
 
-    assert cfg["self_reference"] == "小源"
-    assert cfg["civil_language"]["enabled"] is True
+    assert config["outgoing_policy"]["self_reference"] == "小源"
+    assert config["outgoing_policy"]["civil_language"]["enabled"] is True
     assert cfg["recruitment"]["website"] == "https://cdut-osa.cn"
     assert cfg["recruitment"]["append_on_relevant_topic"] is True
     assert cfg["proactive_join"]["score_bonus"] >= 15

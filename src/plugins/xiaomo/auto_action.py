@@ -37,6 +37,13 @@ _GENERIC_BUBBLE_RE = re.compile(
 )
 
 
+def _last_turn_allows_contextual_bubble(group_id: str) -> bool:
+    return not state.group_last_human_turn_directed_elsewhere.get(
+        str(group_id),
+        False,
+    )
+
+
 # ─── 主动发言决策 ─────────────────────────────────────────────────────────────
 
 
@@ -334,6 +341,12 @@ async def start_bubble_loop():
                     continue
 
                 if is_quiet_hours():
+                    continue
+                if not _last_turn_allows_contextual_bubble(gid):
+                    logger.info(
+                        "Contextual bubble skipped after human-directed turn: group=%s",
+                        gid,
+                    )
                     continue
                 recent_context = await _recent_group_context(gid)
                 if not recent_context:

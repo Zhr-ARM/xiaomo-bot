@@ -26,6 +26,9 @@ group_recent_messages: dict[str, list[str]] = {}
 # 群短期文本流：用于主动接话时理解刚刚发生的聊天，不进入长期记忆
 group_recent_texts: dict[str, list[dict]] = {}
 
+# 每群最新一条人类消息是否明确发给其他成员；用于阻止迟到的自动冒泡抢话。
+group_last_human_turn_directed_elsewhere: dict[str, bool] = {}
+
 # 群短期连续对话：一次明确 @/点名后，允许同一成员自然续聊而不必每句再 @。
 # 每个群只保留一位当前对话成员，避免多人聊天时抢错话。
 group_dialogue_sessions: dict[str, dict] = {}
@@ -289,6 +292,7 @@ def record_recent_group_text(
     mentioned_qqs: list[str] | None = None,
     reply_to_message_id: str | None = None,
     carried_from_previous: bool = False,
+    addressed_elsewhere: bool = False,
     now: float | None = None,
 ) -> None:
     """Record a short-lived group text snippet for ambient participation."""
@@ -297,6 +301,9 @@ def record_recent_group_text(
         return
     if now is None:
         now = time.time()
+    group_last_human_turn_directed_elsewhere[str(group_id)] = bool(
+        addressed_elsewhere
+    )
 
     recent = [
         item
@@ -313,6 +320,7 @@ def record_recent_group_text(
             "mentioned_qqs": [str(qq) for qq in (mentioned_qqs or [])],
             "reply_to_message_id": str(reply_to_message_id or ""),
             "carried_from_previous": bool(carried_from_previous),
+            "addressed_elsewhere": bool(addressed_elsewhere),
         }
     )
     group_recent_texts[group_id] = recent[-RECENT_TEXT_LIMIT:]
@@ -486,11 +494,29 @@ def observe_proactive_join_feedback(
         and pending_source == str(reply_to_message_id)
     )
     normalized = (text or "").strip().lower()
+    rejection_signal = any(
+        cue in normalized
+        for cue in (
+            "谁问你了",
+            "没问你",
+            "没有问你",
+            "又没问你",
+            "没叫你",
+            "不是问你",
+            "别乱接话",
+            "不要乱接话",
+            "别插话",
+            "闭嘴",
+        )
+    )
     conversational_signal = any(
         cue in normalized
         for cue in ("?", "？", "哈哈", "确实", "对", "不是", "怎么", "为啥", "谢谢")
     )
-    if now <= float(pending.get("expires_at", 0)) and (
+    if rejection_signal and now <= float(pending.get("expires_at", 0)):
+        score = max(-0.35, score - 0.18)
+        outcome = "rejected"
+    elif now <= float(pending.get("expires_at", 0)) and (
         mentions_bot or direct_reply or conversational_signal
     ):
         score = min(0.35, score + 0.08)

@@ -70,3 +70,43 @@ async def test_pending_queue_caps_keep_recent_explicit_messages(monkeypatch):
 
     for key in list(window._pending):
         window.flush(key)
+
+
+@pytest.mark.asyncio
+async def test_solicited_turn_preempts_ambient_processing():
+    window = SilentWindow()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    fired = []
+
+    async def callback(_key, messages):
+        fired.append(messages)
+        if not messages[0].get("explicit_trigger"):
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    window.set_callback(callback)
+    window.enqueue(
+        "group:g1",
+        {"text": "ambient", "explicit_trigger": False},
+        is_group=True,
+        wait_seconds=0,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    window.enqueue(
+        "group:g1",
+        {"text": "@bot direct", "explicit_trigger": True},
+        is_group=True,
+        wait_seconds=0,
+    )
+
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+
+    assert any(batch[0]["text"] == "@bot direct" for batch in fired)
+    await window.close()

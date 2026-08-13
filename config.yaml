@@ -78,13 +78,16 @@ proactive_join:
     short_reply: 0.82
     helpful_reply: 0.95
 
+# 所有群共用的出站表达约束。
+outgoing_policy:
+  self_reference: "小源"
+  civil_language:
+    enabled: true
+    fallback: "这句容易伤人，小源不评价人，还是聊事情本身吧。"
+
 # 群级行为覆盖：只影响指定群，不改变其他群的人设和活跃度。
 group_policies:
   "972277179":
-    self_reference: "小源"
-    civil_language:
-      enabled: true
-      fallback: "这句容易伤人，小源不评价人，还是聊事情本身吧。"
     recruitment:
       enabled: true
       website: "https://cdut-osa.cn"

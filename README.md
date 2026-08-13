@@ -277,13 +277,17 @@ proactive_join:
     short_reply: 0.82
     helpful_reply: 0.95
 
+# 明确 @ / 回复其他成员的消息只记入上下文，不触发主动接话。
+# 所有群共用的出站表达约束
+outgoing_policy:
+  self_reference: "小源"        # 所有第一人称自称统一为“小源”
+  civil_language:
+    enabled: true
+    fallback: "这句容易伤人，小源不评价人，还是聊事情本身吧。"
+
 # 群级覆盖：只调整指定群。明确 @ / 点名回复不受主动消息上限影响。
 group_policies:
   "972277179":
-    self_reference: "小源"       # 自指“我”在出站前统一为“小源”
-    civil_language:
-      enabled: true
-      fallback: "这句容易伤人，小源不评价人，还是聊事情本身吧。"
     recruitment:
       enabled: true
       website: "https://cdut-osa.cn"

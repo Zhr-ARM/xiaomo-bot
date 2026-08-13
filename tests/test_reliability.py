@@ -11,6 +11,7 @@ from src.plugins.xiaomo import (
     auto_action,
     database,
     memory,
+    state,
     vector_store,
     weather,
     web_search,
@@ -228,6 +229,16 @@ def test_contextual_bubble_rejects_generic_presence_checks():
         auto_action._clean_contextual_bubble("机械制图那课最后真不教 CAD 吗？")
         == "机械制图那课最后真不教 CAD 吗？"
     )
+
+
+def test_contextual_bubble_yields_after_human_directed_turn():
+    state.group_last_human_turn_directed_elsewhere["g1"] = True
+    try:
+        assert auto_action._last_turn_allows_contextual_bubble("g1") is False
+        state.group_last_human_turn_directed_elsewhere["g1"] = False
+        assert auto_action._last_turn_allows_contextual_bubble("g1") is True
+    finally:
+        state.group_last_human_turn_directed_elsewhere.pop("g1", None)
 
 
 @pytest.mark.asyncio
